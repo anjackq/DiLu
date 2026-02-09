@@ -1,9 +1,12 @@
 
 ############ Large language model config ############
-OPENAI_API_TYPE: # 'openai' or 'azure'
+OPENAI_API_TYPE: 'ollama' # 'openai' or 'azure' or 'ollama'
 # below are for Openai
-OPENAI_KEY: # 'sk-xxxxxx' 
-OPENAI_CHAT_MODEL: 'gpt-4-1106-preview' # Alternative models: 'gpt-3.5-turbo-16k-0613' (note: performance may vary)
+#OPENAI_KEY: 'OLLAMA'
+#OPENAI_CHAT_MODEL: 'gpt-4-1106-preview' # Alternative models: 'gpt-3.5-turbo-16k-0613' (note: performance may vary)
+OPENAI_KEY: 'ollama'
+OPENAI_CHAT_MODEL: 'qwen2.5:14b'
+
 # below are for Azure OAI service
 AZURE_API_BASE: # https://xxxxxxx.openai.azure.com/
 AZURE_API_VERSION: "2023-07-01-preview"
@@ -12,11 +15,12 @@ AZURE_CHAT_DEPLOY_NAME: # chat model deployment name
 AZURE_EMBED_DEPLOY_NAME: # text embed model deployment name  
 
 ############### DiLu settings ############
-reflection_module: False # True or False
-few_shot_num: 3 # 0 for zero-shot
-episodes_num: 3 # run episodes
-memory_path: 'memories/20_mem'
-result_folder: 'results'
+reflection_module: True # True or False
+few_shot_num: 0 # 0 for zero-shot, IMPORTANT: Set to 0 or 1 for local models to avoid context errors
+episodes_num: 5 # run episodes
+#memory_path: 'memories/20_mem' # IMPORTANT: OpenAI and Ollamal model might have different dimension for memories
+memory_path: 'memories/20_mem_ollama_qwen_updated'
+result_folder: 'results/qwen2_5_14b'
 
 ############ Highway-env config ############
 simulation_duration: 20 # step

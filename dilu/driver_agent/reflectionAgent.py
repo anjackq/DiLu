@@ -1,17 +1,19 @@
 import os
 import textwrap
 import time
-from langchain.chat_models import AzureChatOpenAI, ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-
 from rich import print
+
+# UPDATED IMPORTS
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 
 class ReflectionAgent:
     def __init__(
-        self, temperature: float = 0.0, verbose: bool = False
+            self, temperature: float = 0.0, verbose: bool = False
     ) -> None:
         oai_api_type = os.getenv("OPENAI_API_TYPE")
+
         if oai_api_type == "azure":
             print("Using Azure Chat API")
             self.llm = AzureChatOpenAI(
@@ -21,10 +23,19 @@ class ReflectionAgent:
                 request_timeout=60,
             )
         elif oai_api_type == "openai":
-            print("[red]Cautious: Reflection mode uses OpenAI GPT-4, may cost a lot of money![/red]")
+            # Check if we are using Ollama (localhost) to avoid hardcoded GPT-4
+            base_url = os.getenv("OPENAI_API_BASE", "")
+            if "localhost" in base_url or "127.0.0.1" in base_url:
+                model_name = os.getenv("OPENAI_CHAT_MODEL")
+                print(f"[yellow]Reflection Agent using Local Ollama: {model_name}[/yellow]")
+            else:
+                # Default to strong GPT-4 for OpenAI reflection
+                model_name = 'gpt-4-1106-preview'
+                print("[red]Cautious: Reflection mode uses OpenAI GPT-4, may cost a lot of money![/red]")
+
             self.llm = ChatOpenAI(
                 temperature=temperature,
-                model_name='gpt-4-1106-preview',
+                model_name=model_name,
                 max_tokens=1000,
                 request_timeout=60,
             )
@@ -60,19 +71,30 @@ class ReflectionAgent:
             <Your corrected version of ChatGPT response>
         """)
 
-        print("Self-reflection is running, make take time...")
+        print("Self-reflection is running, may take time...")
         start_time = time.time()
         messages = [
             SystemMessage(content=system_message),
             HumanMessage(content=human_message),
         ]
-        response = self.llm(messages)
+
+        # UPDATED: Use .invoke() instead of __call__
+        response = self.llm.invoke(messages)
+
         target_phrase = f"{delimiter} What should ChatGPT do to avoid such errors in the future:"
-        substring = response.content[response.content.find(
-            target_phrase)+len(target_phrase):].strip()
+
+        # Add safety check if target phrase is missing (common with smaller local models)
+        if target_phrase in response.content:
+            substring = response.content[response.content.find(
+                target_phrase) + len(target_phrase):].strip()
+        else:
+            # Fallback if model didn't follow strict formatting
+            print("[yellow]Warning: Reflection output format mismatch. Saving full content.[/yellow]")
+            substring = response.content
+
         corrected_memory = f"{delimiter} I have made a misake before and below is my self-reflection:\n{substring}"
         print("Reflection done. Time taken: {:.2f}s".format(
             time.time() - start_time))
-        print("corrected_memory:", corrected_memory)
+        # print("corrected_memory:", corrected_memory)
 
         return corrected_memory

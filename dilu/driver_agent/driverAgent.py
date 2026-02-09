@@ -4,14 +4,16 @@ import time
 from rich import print
 from typing import List
 
-from langchain.chat_models import AzureChatOpenAI, ChatOpenAI
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
-from langchain.callbacks import get_openai_callback, OpenAICallbackHandler, StreamingStdOutCallbackHandler
+# UPDATED IMPORTS
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_community.callbacks import get_openai_callback, OpenAICallbackHandler
+from langchain_core.callbacks import StreamingStdOutCallbackHandler
 
 from dilu.scenario.envScenario import EnvScenario
 
-
 delimiter = "####"
+# ... (Keep example_message and example_answer variables as they are in original) ...
 example_message = textwrap.dedent(f"""\
         {delimiter} Driving scenario description:
         You are driving on a road with 4 lanes, and you are currently driving in the second lane from the left. Your speed is 25.00 m/s, acceleration is 0.00 m/s^2, and lane position is 363.14 m. 
@@ -39,15 +41,15 @@ example_answer = textwrap.dedent(f"""\
         - Now I want to see if I can change lanes to the right. The car in front of me on the right lane is car 864. The distance between me and car 864 is 373.74-363.14 = 10.6 m, and the difference in speed is 23.61-25.00=-3.7 m/s. Car 864 is traveling 10.6 m ahead of me and its speed is 3.7 m/s slower than mine. The distance is too close and my speed is higher than the front car on the right lane. the safety lane-change distance is 25m. if I change lanes to the right, I may collide with it. So I cannot change lanes to the right.
         - Now my only option is to slow down to keep me safe.
         Final Answer: Deceleration
-                                         
+
         Response to user:#### 4
         """)
 
 
 class DriverAgent:
     def __init__(
-        self, sce: EnvScenario,
-        temperature: float = 0, verbose: bool = False
+            self, sce: EnvScenario,
+            temperature: float = 0, verbose: bool = False
     ) -> None:
         self.sce = sce
         oai_api_type = os.getenv("OPENAI_API_TYPE")
@@ -76,7 +78,9 @@ class DriverAgent:
                 streaming=True,
             )
 
-    def few_shot_decision(self, scenario_description: str = "Not available", previous_decisions: str = "Not available", available_actions: str = "Not available", driving_intensions: str = "Not available", fewshot_messages: List[str] = None, fewshot_answers: List[str] = None):
+    def few_shot_decision(self, scenario_description: str = "Not available", previous_decisions: str = "Not available",
+                          available_actions: str = "Not available", driving_intensions: str = "Not available",
+                          fewshot_messages: List[str] = None, fewshot_answers: List[str] = None):
         # for template usage refer to: https://python.langchain.com/docs/modules/model_io/prompts/prompt_templates/
 
         system_message = textwrap.dedent(f"""\
@@ -126,11 +130,14 @@ class DriverAgent:
         )
         # print("fewshot number:", (len(messages) - 2)/2)
         start_time = time.time()
+
+        # NOTE: get_openai_callback might return 0 for Ollama
         # with get_openai_callback() as cb:
-        # response = self.llm(messages)
-        # print(response.content)
+        # response = self.llm.invoke(messages) # invoke instead of __call__
+
         print("[cyan]Agent answer:[/cyan]")
         response_content = ""
+        # .stream() is widely supported in newer langchain versions
         for chunk in self.llm.stream(messages):
             response_content += chunk.content
             print(chunk.content, end="", flush=True)
@@ -144,7 +151,7 @@ class DriverAgent:
             print("Output is not a int number, checking the output...")
             check_message = f"""
             You are a output checking assistant who is responsible for checking the output of another agent.
-            
+
             The output you received is: {decision_action}
 
             Your should just output the right int type of action_id, with no other characters or delimiters.
@@ -165,12 +172,12 @@ class DriverAgent:
                 HumanMessage(content=check_message),
             ]
             with get_openai_callback() as cb:
-                check_response = self.llm(messages)
+                check_response = self.llm.invoke(messages)  # Changed from self.llm(messages)
             result = int(check_response.content.split(delimiter)[-1])
 
         few_shot_answers_store = ""
         for i in range(len(fewshot_messages)):
             few_shot_answers_store += fewshot_answers[i] + \
-                "\n---------------\n"
+                                      "\n---------------\n"
         print("Result:", result)
         return result, response_content, human_message, few_shot_answers_store

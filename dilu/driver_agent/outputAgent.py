@@ -3,17 +3,18 @@ import json
 from rich import print
 import sqlite3
 
-from langchain.chat_models import AzureChatOpenAI
-from langchain.callbacks import get_openai_callback
+# UPDATED IMPORTS
+from langchain_openai import AzureChatOpenAI
+from langchain_community.callbacks import get_openai_callback
 from langchain.output_parsers import ResponseSchema
 from langchain.output_parsers import StructuredOutputParser
-from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
 
-from scenario.scenario import Scenario
+from dilu.scenario.envScenario import EnvScenario # Fixed import (was scenario.scenario)
 
 
 class OutputParser:
-    def __init__(self, sce: Scenario, temperature: float = 0.0) -> None:
+    def __init__(self, sce: EnvScenario, temperature: float = 0.0) -> None:
         self.sce = sce
         self.temperature = temperature
         self.llm = AzureChatOpenAI(
@@ -46,7 +47,7 @@ class OutputParser:
         input = prompt_template.format_prompt(
             answer=final_results['answer']+final_results['thoughts'])
         with get_openai_callback() as cb:
-            output = self.llm(input.to_messages())
+            output = self.llm.invoke(input.to_messages()) # Changed from self.llm(...)
 
         self.parseredOutput = self.output_parser.parse(output.content)
         self.dataCommit()

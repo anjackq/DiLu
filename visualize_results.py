@@ -7,8 +7,9 @@ import argparse
 from dilu.scenario.envScenarioReplay import EnvScenarioReplay
 from dilu.driver_agent.vectorStore import DrivingMemory
 
-
 config = yaml.load(open('config.yaml'), Loader=yaml.FullLoader)
+
+# --- Configuration Setup ---
 if config['OPENAI_API_TYPE'] == 'azure':
     os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
     os.environ["OPENAI_API_VERSION"] = config['AZURE_API_VERSION']
@@ -20,9 +21,17 @@ elif config['OPENAI_API_TYPE'] == 'openai':
     os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
     os.environ["OPENAI_API_KEY"] = config['OPENAI_KEY']
     os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
+# [NEW] Added Ollama Support
+elif config['OPENAI_API_TYPE'] == 'ollama':
+    os.environ["OPENAI_API_TYPE"] = 'openai'
+    # Set both legacy and new base URL vars for maximum compatibility
+    os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+    os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
+    os.environ["OPENAI_API_KEY"] = "ollama"
+    os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
+    print(f"[bold yellow]Visualizer Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/bold yellow]")
 else:
-    raise ValueError("Unknown OPENAI_API_TYPE, should be azure or openai")
-
+    raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
 
 TAMDTemplate = """
 # Thoughts and Actions
@@ -35,7 +44,9 @@ The following sentences are the **Thoughts and Actions** made by **Driver Agent*
 """
 
 
-def viewFrame(decisionFrame: int) -> str:
+def viewFrame(decisionFrame):
+    # Ensure input is int for internal logic
+    decisionFrame = int(decisionFrame)
     imd = esr.plotSce(decisionFrame)
     framePrompts = esr.getPrompts(decisionFrame)
     if framePrompts.done:
@@ -48,92 +59,80 @@ def viewFrame(decisionFrame: int) -> str:
     else:
         editedTimeString = ""
 
-    if framePrompts.editedTA:
-        TAMDStr = TAMDTemplate.format(
-            decisionFrame, doneString, editedTimeString,
-        )
-        return (
-            imd, framePrompts.description,
-            framePrompts.fewshots, TAMDStr,
-            framePrompts.editedTA
-        )
-    else:
-        TAMDStr = TAMDTemplate.format(
-            decisionFrame, doneString, editedTimeString,
-        )
-        return (
-            imd, framePrompts.description,
-            framePrompts.fewshots, TAMDStr,
-            framePrompts.thoughtsAndAction
-        )
+    TAMDStr = TAMDTemplate.format(
+        decisionFrame, doneString, editedTimeString,
+    )
+
+    # Use edited thoughts if they exist
+    final_ta = framePrompts.editedTA if framePrompts.editedTA else framePrompts.thoughtsAndAction
+
+    return (
+        imd, framePrompts.description,
+        framePrompts.fewshots, TAMDStr,
+        final_ta
+    )
 
 
-def nextFramePrompts(decisionFrame: int):
+def nextFramePrompts(decisionFrame):
     nextFrame = int(decisionFrame) + 1
     if nextFrame <= maxFrame:
-        imd, descriptionStr, fewshotsStr, TAMDStr, TAStr = viewFrame(
-            nextFrame)
+        imd, descriptionStr, fewshotsStr, TAMDStr, TAStr = viewFrame(nextFrame)
+        # Return str(nextFrame) to update the Dropdown
         return str(nextFrame), imd, descriptionStr, fewshotsStr, TAMDStr, TAStr
     else:
-        gr.Error('The range of Decision Frame is {}~{}.'.format(
-            minFrame, maxFrame
-        ))
+        raise gr.Error(f'The range of Decision Frame is {minFrame}~{maxFrame}.')
 
 
-def lastFramePrompts(decisionFrame: int):
+def lastFramePrompts(decisionFrame):
     lastFrame = int(decisionFrame) - 1
     if lastFrame >= 0:
-        imd, descriptionStr, fewshotsStr, TAMDStr, TAStr = viewFrame(
-            lastFrame)
+        imd, descriptionStr, fewshotsStr, TAMDStr, TAStr = viewFrame(lastFrame)
         return str(lastFrame), imd, descriptionStr, fewshotsStr, TAMDStr, TAStr
     else:
-        raise gr.Error('The range of Decision Frame is {}~{}.'.format(
-            minFrame, maxFrame
-        ))
+        raise gr.Error(f'The range of Decision Frame is {minFrame}~{maxFrame}.')
 
 
-def commitExperience(decisionFrame: int, expertExperience: str):
+def commitExperience(decisionFrame, expertExperience):
     try:
+        decisionFrame = int(decisionFrame)
         framePrompts = esr.getPrompts(decisionFrame)
-        # description , expertExperience
+
+        # Regex to extract scenario
         pattern = r"#### Driving scenario description:(.*?)####"
-        match = re.search(pattern,  framePrompts.description, re.DOTALL)
+        match = re.search(pattern, framePrompts.description, re.DOTALL)
         if match:
             sce_descrip = match.group(1).strip()
         else:
-            raise gr.Error(
-                "Cannot find Driving scenario description in human_question.")
+            raise gr.Error("Cannot find Driving scenario description in prompt.")
+
+        # Regex to extract action
         pattern = r"Response to user:#### (\d+)"
         match = re.search(pattern, expertExperience)
         if match:
             action = int(match.group(1))
             print("action: ", action)
         else:
-            raise gr.Error(
-                "Plase make sure the last line contains 'Response to user:####'.")
+            raise gr.Error("Please make sure the last line contains 'Response to user:#### <Action_ID>'.")
+
         vector_memory.addMemory(
             sce_descrip, framePrompts.description, expertExperience, action)
 
         esr.editTA(decisionFrame, expertExperience)
         gr.Info('The Thoughts and Actions has been edited and committed.')
+
+        # Refresh view
         _, _, _, TAMDStr, TAStr = viewFrame(decisionFrame)
         return TAMDStr, TAStr
     except Exception as e:
-        gr.Error(
-            'There is something wrong when commit the edited Thoughts and Actions.'
-        )
+        gr.Error(f'Error committing experience: {str(e)}')
         raise e
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Example program with command line arguments.")
-    parser.add_argument("-r", "--result_db_path", type=str,
-                        help="Path to the result database.")
-    parser.add_argument("-m", "--mem_path", type=str,
-                        help="Path to the memory database.")
+    parser = argparse.ArgumentParser(description="Visualizer for DiLu Results")
+    parser.add_argument("-r", "--result_db_path", type=str, help="Path to result db", required=True)
+    parser.add_argument("-m", "--mem_path", type=str, help="Path to memory db", required=True)
     args = parser.parse_args()
-
 
     esr = EnvScenarioReplay(args.result_db_path)
     minFrame, maxFrame = esr.getMinMaxFrame()
@@ -141,10 +140,14 @@ if __name__ == '__main__':
 
     with gr.Blocks(theme=gr.themes.Base(text_size=gr.themes.sizes.text_lg)) as demo:
         with gr.Row(visible=True, variant='panel'):
-            # decisionFrame = gr.Number(minimum=minFrame, maximum=maxFrame, scale=1)
-            frameRange = range(minFrame, maxFrame+1)
+            # FIX 1: Convert range to list of strings to match Dropdown value type
+            frame_values = [str(f) for f in range(minFrame, maxFrame + 1)]
+
             decisionFrame = gr.Dropdown(
-                frameRange, value='0', label="Decision Frame"
+                choices=frame_values,
+                value=str(minFrame),
+                label="Decision Frame",
+                interactive=True
             )
             viewerBtn = gr.Button(scale=1, value='View Scenario')
             lastFrameBtn = gr.Button(scale=1, value="Last Frame")
@@ -154,51 +157,33 @@ if __name__ == '__main__':
             currentImage = gr.Image(interactive=False, scale=1)
             with gr.Column():
                 DesMD = gr.Markdown("# Driving scenario description")
-                descriptionText = gr.TextArea(
-                    scale=1, interactive=False, lines=28,
-                    label=""
-                )
+                descriptionText = gr.TextArea(scale=1, interactive=False, lines=28, label="")
 
         with gr.Row(visible=True, variant='panel'):
             with gr.Column():
                 FSMD = gr.Markdown("# Few-shot")
-                fewShotsText = gr.TextArea(
-                    scale=1, interactive=False,
-                    label="", lines=35
-                )
+                fewShotsText = gr.TextArea(scale=1, interactive=False, label="", lines=35)
             with gr.Column():
                 TAMD = gr.Markdown("# Thoughts and Actions")
-                TAText = gr.TextArea(
-                    scale=1, interactive=True,
-                    lines=28, label=""
-                )
+                TAText = gr.TextArea(scale=1, interactive=True, lines=28, label="")
 
         commitBtn = gr.Button(value='Commit Experience')
+
+        # Event Listeners
         viewerBtn.click(
             viewFrame,
-            inputs=[decisionFrame,],
-            outputs=[
-                currentImage, descriptionText,
-                fewShotsText, TAMD, TAText
-            ],
+            inputs=[decisionFrame],
+            outputs=[currentImage, descriptionText, fewShotsText, TAMD, TAText],
         )
         lastFrameBtn.click(
             lastFramePrompts,
-            inputs=[decisionFrame,],
-            outputs=[
-                decisionFrame, currentImage,
-                descriptionText, fewShotsText,
-                TAMD, TAText
-            ],
+            inputs=[decisionFrame],
+            outputs=[decisionFrame, currentImage, descriptionText, fewShotsText, TAMD, TAText],
         )
         nextFrameBtn.click(
             nextFramePrompts,
-            inputs=[decisionFrame,],
-            outputs=[
-                decisionFrame, currentImage,
-                descriptionText, fewShotsText,
-                TAMD, TAText
-            ],
+            inputs=[decisionFrame],
+            outputs=[decisionFrame, currentImage, descriptionText, fewShotsText, TAMD, TAText],
         )
         commitBtn.click(
             commitExperience,
@@ -206,5 +191,6 @@ if __name__ == '__main__':
             outputs=[TAMD, TAText],
         )
 
-    demo.queue(concurrency_count=2)
+    # FIX 2: Removed deprecated concurrency_count from queue()
+    demo.queue()
     demo.launch()

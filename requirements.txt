@@ -1,11 +1,16 @@
 gymnasium==0.28.1
 highway-env==1.8.2
 langchain==0.0.335
+#langchain>=0.1.0
+#langchain-community
+#langchain-openai
 openai==0.28.1
 chromadb==0.3.29
 matplotlib==3.7.1
 numpy==1.24.3
+#numpy
 PyYAML==6.0
+#PyYAML
 gradio==3.36.0
 gradio_client==0.2.7
 rich
