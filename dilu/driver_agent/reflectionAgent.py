@@ -25,8 +25,11 @@ class ReflectionAgent:
         elif oai_api_type == "openai":
             # Check if we are using Ollama (localhost) to avoid hardcoded GPT-4
             base_url = os.getenv("OPENAI_API_BASE", "")
+
+            # FORCE the Reflection Agent to use a smarter model
+            # distinct from the driving model
             if "localhost" in base_url or "127.0.0.1" in base_url:
-                model_name = os.getenv("OPENAI_CHAT_MODEL")
+                model_name = "deepseek-r1:14b"
                 print(f"[yellow]Reflection Agent using Local Ollama: {model_name}[/yellow]")
             else:
                 # Default to strong GPT-4 for OpenAI reflection
@@ -50,7 +53,7 @@ class ReflectionAgent:
         <reasoning>
         <reasoning>
         <repeat until you have a decision>
-        Response to user:{delimiter} <only output one `Action_id` as a int number of you decision, without any action name or explanation. The output decision must be unique and not ambiguous, for example if you decide to decelearate, then output `4`> 
+        Response to user:{delimiter} <only checkpoints one `Action_id` as a int number of you decision, without any action name or explanation. The checkpoints decision must be unique and not ambiguous, for example if you decide to decelearate, then checkpoints `4`> 
 
         Make sure to include {delimiter} to separate every step.
         """)
@@ -60,8 +63,8 @@ class ReflectionAgent:
             ``` ChatGPT Response ```
             {llm_response}
 
-            Now, you know this action ChatGPT output cause a collison after taking this action, which means there are some mistake in ChatGPT resoning and cause the wrong action.    
-            Please carefully check every reasoning in ChatGPT response and find out the mistake in the reasoning process of ChatGPT, and also output your corrected version of ChatGPT response.
+            Now, you know this action ChatGPT checkpoints cause a collison after taking this action, which means there are some mistake in ChatGPT resoning and cause the wrong action.    
+            Please carefully check every reasoning in ChatGPT response and find out the mistake in the reasoning process of ChatGPT, and also checkpoints your corrected version of ChatGPT response.
             Your answer should use the following format:
             {delimiter} Analysis of the mistake:
             <Your analysis of the mistake in ChatGPT reasoning process>
@@ -89,7 +92,7 @@ class ReflectionAgent:
                 target_phrase) + len(target_phrase):].strip()
         else:
             # Fallback if model didn't follow strict formatting
-            print("[yellow]Warning: Reflection output format mismatch. Saving full content.[/yellow]")
+            print("[yellow]Warning: Reflection checkpoints format mismatch. Saving full content.[/yellow]")
             substring = response.content
 
         corrected_memory = f"{delimiter} I have made a misake before and below is my self-reflection:\n{substring}"

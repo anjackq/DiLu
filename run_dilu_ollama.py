@@ -33,11 +33,16 @@ def setup_env(config):
     # [NEW] ADDED OLLAMA SUPPORT HERE
     elif config['OPENAI_API_TYPE'] == 'ollama':
         # We trick the system into thinking it is OpenAI, but point to localhost
-        os.environ["OPENAI_API_TYPE"] = 'openai'
-        os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
-        os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
-        os.environ["OPENAI_API_KEY"] = "ollama"  # Dummy key
-        os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
+        os.environ["OPENAI_API_TYPE"] = 'ollama'
+        #os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+        #os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
+        #os.environ["OPENAI_API_KEY"] = "ollama"  # Dummy key
+        #os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
+        os.environ["OLLAMA_API_BASE"] = config['OLLAMA_API_BASE']
+        os.environ["OPENAI_BASE_URL"] = config['OLLAMA_API_BASE']
+        os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
+        os.environ["OLLAMA_API_KEY"] = config['OLLAMA_API_KEY']
+
         print(f"[bold yellow]Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/bold yellow]")
     else:
         raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
@@ -164,21 +169,33 @@ if __name__ == '__main__':
                     "sce": copy.deepcopy(sce)
                 })
 
-                obs, reward, done, info, _ = env.step(action)
+                #obs, reward, done, info, _ = env.step(action)
+                if isinstance(action, str):
+                    action = int(action)
+                action = int(action)
+
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+
                 already_decision_steps += 1
 
                 env.render()
                 sce.promptsCommit(i, None, done, human_question,
                                   fewshot_answer, response)
-                env.unwrapped.automatic_rendering_callback = env.video_recorder.capture_frame()
+                #env.unwrapped.automatic_rendering_callback = env.video_recorder.capture_frame()
 
                 print("--------------------")
 
                 if done:
+                    print(f"[red]Episode ended at step {i}. terminated={terminated}, truncated={truncated}, info={info}[/red]")
                     print("[red]Simulation crash after running steps: [/red] ", i)
                     collision_frame = i
                     break
         finally:
+
+            with open(result_folder + "/" + 'log.txt', 'a') as f:
+                f.write("Simulation {} | Seed {} | Steps: {} | File prefix: {} \n".format(
+                    episode, seed, already_decision_steps, result_prefix))
 
             with open(result_folder + "/" + 'log.txt', 'a') as f:
                 f.write(
@@ -231,4 +248,10 @@ if __name__ == '__main__':
 
             print("==========Simulation {} Done==========".format(episode))
             episode += 1
-            env.close()
+
+            try:
+                env.close()
+            except Exception:
+                pass
+
+

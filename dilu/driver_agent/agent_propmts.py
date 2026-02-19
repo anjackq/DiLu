@@ -13,7 +13,7 @@ POSSIBLE_ADD_RULES = """
 
 DECISION_CAUTIONS = """
 1. DO NOT finish the task until you have a final answer.
-2. Your final output decision must be unique and not ambiguous.
+2. Your final checkpoints decision must be unique and not ambiguous.
 3. You need to know your available actions and available lanes before you make any decision.
 """
 

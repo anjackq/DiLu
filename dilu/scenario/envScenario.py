@@ -41,14 +41,16 @@ class EnvScenario:
         self.env = env
         self.envType = envType
 
-        self.ego: MDPVehicle = env.vehicle
+        #self.ego: MDPVehicle = env.vehicle
+        self.ego: MDPVehicle = env.unwrapped.vehicle
         # 下面的四个变量用来判断车辆是否在 ego 的危险视距内
         self.theta1 = math.atan(3/17.5)
         self.theta2 = math.atan(2/2.5)
         self.radius1 = np.linalg.norm([3, 17.5])
         self.radius2 = np.linalg.norm([2, 2.5])
 
-        self.road: Road = env.road
+        #self.road: Road = env.road
+        self.road: Road = env.unwrapped.road
         self.network: RoadNetwork = self.road.network
 
         self.plotter = ScePlotter()
@@ -68,10 +70,17 @@ class EnvScenario:
         self.dbBridge.insertSimINFO(envType, seed)
         self.dbBridge.insertNetwork()
 
+#    def getSurrendVehicles(self, vehicles_count: int) -> List[IDMVehicle]:
+#        return self.road.close_vehicles_to(
+#            self.ego, self.env.PERCEPTION_DISTANCE,
+#            count=vehicles_count-1, see_behind=True,
+#            sort='sorted'
+#        )
     def getSurrendVehicles(self, vehicles_count: int) -> List[IDMVehicle]:
+        # FIX: Use .unwrapped to access PERCEPTION_DISTANCE
         return self.road.close_vehicles_to(
-            self.ego, self.env.PERCEPTION_DISTANCE,
-            count=vehicles_count-1, see_behind=True,
+            self.ego, self.env.unwrapped.PERCEPTION_DISTANCE,
+            count=vehicles_count - 1, see_behind=True,
             sort='sorted'
         )
 
@@ -109,7 +118,8 @@ class EnvScenario:
 
     def availableActionsDescription(self) -> str:
         avaliableActionDescription = 'Your available actions are: \n'
-        availableActions = self.env.get_available_actions()
+        #availableActions = self.env.get_available_actions()
+        availableActions = self.env.unwrapped.get_available_actions()
         for action in availableActions:
             avaliableActionDescription += ACTIONS_DESCRIPTION[action] + ' Action_id: ' + str(
                 action) + '\n'

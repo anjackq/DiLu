@@ -24,9 +24,9 @@ class OutputParser:
         # todo: put into a yaml file
         self.response_schemas = [
             ResponseSchema(
-                name="action_id", description=f"output the id(int) of the decision. The comparative table is:  {{ 0: 'change_lane_left', 1: 'keep_speed or idle', 2: 'change_lane_right', 3: 'accelerate or faster',4: 'decelerate or slower'}} . For example, if the ego car wants to keep speed, please output 1 as a int."),
+                name="action_id", description=f"checkpoints the id(int) of the decision. The comparative table is:  {{ 0: 'change_lane_left', 1: 'keep_speed or idle', 2: 'change_lane_right', 3: 'accelerate or faster',4: 'decelerate or slower'}} . For example, if the ego car wants to keep speed, please checkpoints 1 as a int."),
             ResponseSchema(
-                name="action_name", description=f"output the name(str) of the decision. MUST consist with previous \"action_id\". The comparative table is:  {{ 0: 'change_lane_left', 1: 'keep_speed', 2: 'change_lane_right', 3: 'accelerate',4: 'decelerate'}} . For example, if the action_id is 3, please output 'Accelerate' as a str."),
+                name="action_name", description=f"checkpoints the name(str) of the decision. MUST consist with previous \"action_id\". The comparative table is:  {{ 0: 'change_lane_left', 1: 'keep_speed', 2: 'change_lane_right', 3: 'accelerate',4: 'decelerate'}} . For example, if the action_id is 3, please checkpoints 'Accelerate' as a str."),
             ResponseSchema(
                 name="explanation", description=f"Explain for the driver why you make such decision in 40 words.")
         ]
@@ -51,7 +51,7 @@ class OutputParser:
 
         self.parseredOutput = self.output_parser.parse(output.content)
         self.dataCommit()
-        print("Finish output agent:\n", cb)
+        print("Finish checkpoints agent:\n", cb)
         return self.parseredOutput
 
     def dataCommit(self):

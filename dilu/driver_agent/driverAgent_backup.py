@@ -77,26 +77,6 @@ class DriverAgent:
                 request_timeout=60,
                 streaming=True,
             )
-        # [ADD] Added support for local Ollama models
-        elif oai_api_type == "ollama":
-            model_name = os.getenv("OLLAMA_CHAT_MODEL")
-            api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434/v1")
-            api_key = os.getenv("OLLAMA_API_KEY", "ollama")
-
-            print(f"Using Local Ollama API: {model_name} at {api_base}")
-
-            # Use ChatOpenAI to talk to Ollama's OpenAI-compatible endpoint
-            self.llm = ChatOpenAI(
-                temperature=temperature,
-                model_name=model_name,
-                openai_api_base=api_base,  # or base_url for newer langchain versions
-                openai_api_key=api_key,
-                max_tokens=2000,
-                request_timeout=60,
-                streaming=True,
-            )
-        else:
-            raise ValueError(f"Unknown OPENAI_API_TYPE: {oai_api_type}")
 
     def few_shot_decision(self, scenario_description: str = "Not available", previous_decisions: str = "Not available",
                           available_actions: str = "Not available", driving_intensions: str = "Not available",
@@ -104,19 +84,16 @@ class DriverAgent:
         # for template usage refer to: https://python.langchain.com/docs/modules/model_io/prompts/prompt_templates/
 
         system_message = textwrap.dedent(f"""\
-        You are an autonomous driving decision engine for a highway simulation. 
-        Analyze the scenario provided and checkpoints the single best Action_id integer (0-4).
+        You are ChatGPT, a large language model trained by OpenAI. Now you act as a mature driving assistant, who can give accurate and correct advice for human driver in complex urban driving scenarios.
+        You will be given a detailed description of the driving scenario of current frame along with your history of previous decisions. You will also be given the available actions you are allowed to take. All of these elements are delimited by {delimiter}.
 
-        ### DRIVE LOGIC:
-        1. SAFETY: If a lead car is closer than 25m and your speed is higher, you MUST decelerate (Action_id 4).
-        2. EFFICIENCY: Maintain a target speed of 28m/s. Change lanes (0 or 2) if blocked by slower traffic.
+        Your response should use the following format:
+        <reasoning>
+        <reasoning>
+        <repeat until you have a decision>
+        Response to user:{delimiter} <only checkpoints one `Action_id` as a int number of you decision, without any action name or explanation. The checkpoints decision must be unique and not ambiguous, for example if you decide to decelearate, then checkpoints `4`> 
 
-        ### OUTPUT FORMAT:
-        Reasoning: <one sentence analysis>
-        Response to user:{delimiter} <Action_id_integer>
-        
-        ### ACTION IDS:
-        0: Turn-left, 1: IDLE, 2: Turn-right, 3: Acceleration, 4: Deceleration
+        Make sure to include {delimiter} to separate every step.
         """)
 
         human_message = f"""\
@@ -171,13 +148,13 @@ class DriverAgent:
             if result < 0 or result > 4:
                 raise ValueError
         except ValueError:
-            print("Output is not a int number, checking the output...")
+            print("Output is not a int number, checking the checkpoints...")
             check_message = f"""
-            You are a output checking assistant who is responsible for checking the output of another agent.
+            You are a checkpoints checking assistant who is responsible for checking the checkpoints of another agent.
 
-            The output you received is: {decision_action}
+            The checkpoints you received is: {decision_action}
 
-            Your should just output the right int type of action_id, with no other characters or delimiters.
+            Your should just checkpoints the right int type of action_id, with no other characters or delimiters.
             i.e. :
             | Action_id | Action Description                                     |
             |--------|--------------------------------------------------------|

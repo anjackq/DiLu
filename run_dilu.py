@@ -9,7 +9,7 @@ import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 
 from dilu.scenario.envScenario import EnvScenario
-from dilu.driver_agent.driverAgent import DriverAgent
+from archive.driverAgent import DriverAgent
 from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.driver_agent.reflectionAgent import ReflectionAgent
 

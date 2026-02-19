@@ -205,4 +205,8 @@ figs/
 
 results/
 memories/
+archive/
+fine_tuning/checkpoints
+fine_tuning/merged_models
+unsloth_compiled_cache
 config.yaml

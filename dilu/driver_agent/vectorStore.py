@@ -47,6 +47,19 @@ class DrivingMemory:
                 else:
                     # Standard OpenAI (uses default ada-002)
                     self.embedding = OpenAIEmbeddings()
+
+            # --- ADDED OLLAMA SUPPORT ---
+            elif os.environ.get("OPENAI_API_TYPE") == 'ollama':
+                model_name = os.getenv('OLLAMA_CHAT_MODEL')
+                print(f"[green]Using Ollama Embeddings[/green] with model: {model_name}")
+                # Note: We use the OpenAI-compatible endpoint provided by Ollama
+                self.embedding = OpenAIEmbeddings(
+                    model=model_name,
+                    openai_api_base=os.getenv("OLLAMA_API_BASE"),  # http://localhost:11434/v1
+                    openai_api_key=os.getenv("OLLAMA_API_KEY"),  # 'ollama'
+                    check_embedding_ctx_length=False  # Necessary for some local models
+                )
+
             else:
                 raise ValueError("Unknown OPENAI_API_TYPE: should be azure or openai")
 

@@ -12,8 +12,10 @@ class DBBridge:
     def __init__(self, database: str, env: AbstractEnv) -> None:
         self.database = database
         self.env = env
-        self.ego: MDPVehicle = env.vehicle
-        self.network: RoadNetwork = env.road.network
+        #self.ego: MDPVehicle = env.vehicle
+        self.ego: MDPVehicle = env.unwrapped.vehicle
+        #self.network: RoadNetwork = env.road.network
+        self.network: RoadNetwork = env.unwrapped.road.network
 
     def createTable(self):
         conn = sqlite3.connect(self.database)
