@@ -42,6 +42,7 @@ def setup_env(config):
         os.environ["OPENAI_BASE_URL"] = config['OLLAMA_API_BASE']
         os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
         os.environ["OLLAMA_API_KEY"] = config['OLLAMA_API_KEY']
+        os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
 
         print(f"[bold yellow]Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/bold yellow]")
     else:

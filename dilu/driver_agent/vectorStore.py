@@ -50,7 +50,7 @@ class DrivingMemory:
 
             # --- ADDED OLLAMA SUPPORT ---
             elif os.environ.get("OPENAI_API_TYPE") == 'ollama':
-                model_name = os.getenv('OLLAMA_CHAT_MODEL')
+                model_name = os.getenv('OLLAMA_EMBED_MODEL')
                 print(f"[green]Using Ollama Embeddings[/green] with model: {model_name}")
                 # Note: We use the OpenAI-compatible endpoint provided by Ollama
                 self.embedding = OpenAIEmbeddings(

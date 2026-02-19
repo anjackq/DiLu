@@ -5,7 +5,7 @@ OPENAI_API_TYPE: 'ollama' # 'openai' or 'azure' or 'ollama'
 #OPENAI_KEY: 'OLLAMA'
 #OPENAI_CHAT_MODEL: 'gpt-4-1106-preview' # Alternative models: 'gpt-3.5-turbo-16k-0613' (note: performance may vary)
 OPENAI_KEY: 'ollama'
-OPENAI_CHAT_MODEL: 'glm-4.7-flash:latest'
+OPENAI_CHAT_MODEL: None
 
 # below are for Azure OAI service
 AZURE_API_BASE: # https://xxxxxxx.openai.azure.com/
@@ -20,17 +20,18 @@ OLLAMA_API_BASE: 'http://localhost:11434/v1'
 
 # CHANGE THIS LINE: Replace 'llama3.1:8b' with your fine-tuned model name
 #OLLAMA_CHAT_MODEL: 'phi4-mini-reasoning:3.8b'
-OLLAMA_CHAT_MODEL: 'llama3.1:8b'
+#OLLAMA_CHAT_MODEL: 'llama3.1:8b'
+OLLAMA_CHAT_MODEL: 'deepseek-r1:14b'
+OLLAMA_EMBED_MODEL: 'qwen3-embedding:8b'
 OLLAMA_API_KEY: 'ollama'
 
-
 ############### DiLu settings ############
-reflection_module: False # True or False
-few_shot_num: 0 # 0 for zero-shot, IMPORTANT: Set to 0 or 1 for local models to avoid context errors
+reflection_module: True # True or False
+few_shot_num: 3 # 0 for zero-shot, IMPORTANT: Set to 0 or 1 for local models to avoid context errors
 episodes_num: 3 # run episodes
 #memory_path: 'memories/20_mem' # IMPORTANT: OpenAI and Ollamal model might have different dimension for memories
-memory_path: 'memories/20_mem_phi4_mini_reasoning-3_8b'
-result_folder: 'results/llama3_1-8b'
+memory_path: 'memories/qwen3_embed_8b'
+result_folder: 'results/deepseek-r1_14b'
 
 ############ Highway-env config ############
 simulation_duration: 20 # step

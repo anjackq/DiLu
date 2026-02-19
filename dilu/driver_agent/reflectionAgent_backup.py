@@ -68,34 +68,34 @@ class ReflectionAgent:
 
     def reflection(self, human_message: str, llm_response: str) -> str:
         delimiter = "####"
-
-        # [UPDATED] Removed "ChatGPT" persona and made rules explicit for SLMs
         system_message = textwrap.dedent(f"""\
-                You are an expert autonomous driving reflection engine. Your task is to analyze incorrect driving decisions that led to collisions and provide safety corrections.
-                You will be given a detailed description of a driving scenario and the agent's incorrect response.
+        You are ChatGPT, a large language model trained by OpenAI. Now you act as a mature driving assistant, who can give accurate and correct advice for human driver in complex urban driving scenarios.
+        You will be given a detailed description of the driving scenario of current frame along with the available actions allowed to take. 
 
-                Your answer MUST strictly follow this exact format:
-                {delimiter} Analysis of the mistake:
-                <Your analysis of the mistake in the previous reasoning>
-                {delimiter} What should be done to avoid such errors in the future:
-                <Your advice for safer driving>
-                {delimiter} Corrected version of response:
-                <Corrected reasoning>
-                Response to user:{delimiter} <Corrected Action_id>
-                """)
+        Your response should use the following format:
+        <reasoning>
+        <reasoning>
+        <repeat until you have a decision>
+        Response to user:{delimiter} <only checkpoints one `Action_id` as a int number of you decision, without any action name or explanation. The checkpoints decision must be unique and not ambiguous, for example if you decide to decelearate, then checkpoints `4`> 
 
-        # [UPDATED] Removed ChatGPT references from the human prompt
+        Make sure to include {delimiter} to separate every step.
+        """)
         human_message = textwrap.dedent(f"""\
-                    ``` Human Message ```
-                    {human_message}
-                    ``` Previous Agent Response ```
-                    {llm_response}
+            ``` Human Message ```
+            {human_message}
+            ``` ChatGPT Response ```
+            {llm_response}
 
-                    The action chosen in the Previous Agent Response resulted in a collision. This means there is a critical mistake in the reasoning process.    
-                    Please carefully check the reasoning in the previous response, find the mistake, and output a corrected version of the decision.
-
-                    Strictly follow the output format defined in the system prompt.
-                """)
+            Now, you know this action ChatGPT checkpoints cause a collison after taking this action, which means there are some mistake in ChatGPT resoning and cause the wrong action.    
+            Please carefully check every reasoning in ChatGPT response and find out the mistake in the reasoning process of ChatGPT, and also checkpoints your corrected version of ChatGPT response.
+            Your answer should use the following format:
+            {delimiter} Analysis of the mistake:
+            <Your analysis of the mistake in ChatGPT reasoning process>
+            {delimiter} What should ChatGPT do to avoid such errors in the future:
+            <Your answer>
+            {delimiter} Corrected version of ChatGPT response:
+            <Your corrected version of ChatGPT response>
+        """)
 
         print("Self-reflection is running, may take time...")
         start_time = time.time()
@@ -107,8 +107,7 @@ class ReflectionAgent:
         # UPDATED: Use .invoke() instead of __call__
         response = self.llm.invoke(messages)
 
-        # [UPDATED] The target phrase must match the new prompt exactly!
-        target_phrase = f"{delimiter} What should be done to avoid such errors in the future:"
+        target_phrase = f"{delimiter} What should ChatGPT do to avoid such errors in the future:"
 
         # Add safety check if target phrase is missing (common with smaller local models)
         if target_phrase in response.content:

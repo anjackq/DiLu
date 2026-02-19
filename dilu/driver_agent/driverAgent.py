@@ -30,19 +30,15 @@ example_message = textwrap.dedent(f"""\
         Deceleration - decelerate the vehicle Action_id: 4
         """)
 example_answer = textwrap.dedent(f"""\
-        Well, I have 5 actions to choose from. Now, I would like to know which action is possible. 
-        I should first check if I can acceleration, then idle, finally decelerate.  I can also try to change lanes but with caution and not too frequently.
+        **Step-by-Step Explanation:**
+        1. **Safety Check:** The vehicle directly ahead in my lane (Vehicle 912) is only 19.19 meters away (382.33m - 363.14m), which is under the 25m safety buffer. It is also traveling slower than me (23.30 m/s vs 25.00 m/s). This presents an immediate collision risk.
+        2. **Efficiency Consideration:** My current speed is 25.00 m/s, which is close to the 28 m/s target, but safety supersedes efficiency. Accelerating or maintaining speed will cause a rear-end collision.
+        3. **Lane Change Feasibility:** Changing lanes is not safe. The left lane is blocked by Vehicle 488 (only 5.61m ahead), and the right lane is blocked by Vehicle 864 (only 10.6m ahead). Both are too close to attempt a safe lane change.
+        4. **Conclusion:** Since I cannot safely maintain speed, accelerate, or change lanes due to surrounding traffic, I must decelerate to avoid crashing into Vehicle 912.
 
-        - I want to know if I can accelerate, so I need to observe the car in front of me on the current lane, which is car `912`. The distance between me and car `912` is 382.33 - 363.14 = 19.19 m, and the difference in speed is 23.30 - 25.00 = -1.7 m/s. Car `912` is traveling 19.19 m ahead of me and its speed is 1.7 m/s slower than mine. This distance is too close and my speed is too high, so I should not accelerate.
-        - Since I cannot accelerate, I want to know if I can maintain my current speed. I need to observe the car in front of me on the current lane, which is car `912`. The distance between me and car `912` is 382.33 - 363.14 = 19.19 m, and the difference in speed is 23.30 - 25.00 = -1.7 m/s. Car `912` is traveling 19.19 m ahead of me and its speed is 1.7 m/s slower than mine. This distance is too close and my speed is too high, so if I maintain my current speed, I may collide with it.
-        - Maintain my current speed is not a good idea, so I can only decelearate to keep me safe on my current lane. Deceleraion is a feasible action.
-        - Besides decelearation, I can also try to change lanes. I should carefully check the distance and speed of the cars in front of me on the left and right lanes. Noted that change-lane is not a frequent action, so I should not change lanes too frequently.
-        - I first try to change lanes to the left. The car in front of me on the left lane is car `488`. The distance between me and car `488` is 368.75-363.14=5.61 m, and the difference in speed is 23.61 - 25.00=-1.39 m/s. Car `488` is traveling 5.61 m ahead of me and its speed is 1.39 m/s slower than mine. This distance is too close, the safety lane-change distance is 25m. Besides, my speed is higher than the front car on the left lane. If I change lane to the left, I may collide with it.                                           So I cannot change lanes to the left.
-        - Now I want to see if I can change lanes to the right. The car in front of me on the right lane is car 864. The distance between me and car 864 is 373.74-363.14 = 10.6 m, and the difference in speed is 23.61-25.00=-3.7 m/s. Car 864 is traveling 10.6 m ahead of me and its speed is 3.7 m/s slower than mine. The distance is too close and my speed is higher than the front car on the right lane. the safety lane-change distance is 25m. if I change lanes to the right, I may collide with it. So I cannot change lanes to the right.
-        - Now my only option is to slow down to keep me safe.
-        Final Answer: Deceleration
-
-        Response to user:#### 4
+        **Answer:**
+        Reasoning: The lead car in my lane is critically close (under 25m) and slower, and adjacent lanes are blocked, mandating immediate deceleration.
+        Response to user:{delimiter} 4
         """)
 
 
@@ -104,19 +100,23 @@ class DriverAgent:
         # for template usage refer to: https://python.langchain.com/docs/modules/model_io/prompts/prompt_templates/
 
         system_message = textwrap.dedent(f"""\
-        You are an autonomous driving decision engine for a highway simulation. 
-        Analyze the scenario provided and checkpoints the single best Action_id integer (0-4).
+        You are an autonomous driving decision module. You must strictly follow a Chain of Thought reasoning process before making a decision.
 
         ### DRIVE LOGIC:
         1. SAFETY: If a lead car is closer than 25m and your speed is higher, you MUST decelerate (Action_id 4).
         2. EFFICIENCY: Maintain a target speed of 28m/s. Change lanes (0 or 2) if blocked by slower traffic.
 
-        ### OUTPUT FORMAT:
-        Reasoning: <one sentence analysis>
+        You MUST format your response EXACTLY like this, using these exact headings:
+
+        **Step-by-Step Explanation:**
+        1. **Safety Check:** [Analyze distance and speed of the lead car and adjacent cars]
+        2. **Efficiency Consideration:** [Analyze if you need to speed up to reach the target speed]
+        3. **Lane Change Feasibility:** [Analyze if changing lanes is safe or necessary]
+        4. **Conclusion:** [Summarize the best course of action]
+
+        **Answer:**
+        Reasoning: [1-sentence summary of the conclusion]
         Response to user:{delimiter} <Action_id_integer>
-        
-        ### ACTION IDS:
-        0: Turn-left, 1: IDLE, 2: Turn-right, 3: Acceleration, 4: Deceleration
         """)
 
         human_message = f"""\
