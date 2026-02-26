@@ -93,6 +93,98 @@ python ./visualize_results.py -r results/highway_0.db -m memories/20_mem
 ```
 Open `http://127.0.0.1:7860` to view each frame's prompts and decisions!
 
+## 5. Fork Additions: Local Ollama + Fine-Tuning + Evaluation
+
+This fork adds support for running DiLu with local open-source models via Ollama, plus a fine-tuning workflow and model comparison utilities.
+
+### Local Ollama Runtime
+
+Use the Ollama-specific requirements (newer LangChain/OpenAI client stack):
+
+```bash
+pip install -r requirements_ollama.txt
+```
+
+Create a local config from the tracked template and customize it:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Key settings for local runs:
+- `OPENAI_API_TYPE: 'ollama'`
+- `OLLAMA_CHAT_MODEL`
+- `OLLAMA_REFLECTION_MODEL`
+- `OLLAMA_EMBED_MODEL`
+- `memory_path` (embedding dimensions differ across models, so use separate memory DBs)
+
+Run DiLu with local Ollama:
+
+```bash
+python run_dilu_ollama.py
+```
+
+### Fine-Tuning Workflow (Small/Local Models)
+
+Generate training data (rule-based expert labels from DiLu scenarios):
+
+```bash
+python collect_data.py
+```
+
+Convert data to the strict instruction/output format used by the training scripts:
+
+```bash
+python data/convert_data.py
+```
+
+Train and export a merged model for Ollama (Unsloth + TRL):
+
+```bash
+python fine_tuning/train_dilu_updated.py
+```
+
+Example Ollama Modelfile template is tracked here:
+- `fine_tuning/modelfiles/dilu-llama3_1-8b-v1.Modelfile`
+
+### Compare Models on Fixed Seeds
+
+Run a small smoke comparison:
+
+```bash
+python evaluate_models_ollama.py --models deepseek-r1:14b dilu-llama3_1-8b-v1 --limit 1 --few-shot-num 0
+```
+
+Run a larger comparison:
+
+```bash
+python evaluate_models_ollama.py --models deepseek-r1:14b dilu-llama3_1-8b-v1 --limit 5
+```
+
+This saves a JSON report in `results/`, for example:
+- `results/eval_compare_YYYYMMDD_HHMMSS.json`
+
+Plot the comparison report:
+
+```bash
+python plot_eval_compare.py -i results/eval_compare_YYYYMMDD_HHMMSS.json
+```
+
+This generates a PNG chart with crash rate / no-collision rate / average steps / runtime.
+
+### Git Hygiene (What Is Intentionally Not Tracked)
+
+This fork ignores local/generated artifacts such as:
+- `config.yaml` (local secrets/runtime config)
+- `results/` (videos, DBs, eval reports, plots)
+- `memories/` (Chroma vector stores)
+- `temp/`, `outputs/`
+- `fine_tuning/checkpoints/`, `fine_tuning/merged_models/`, `fine_tuning/adapters/`
+- `unsloth_compiled_cache/`
+- IDE files (e.g. `.idea/`)
+
+Use `config.example.yaml` as the versioned template and keep your real `config.yaml` local.
+
 
 ## 🔖 Citation
 If you find our paper and codes useful, please kindly cite us via:

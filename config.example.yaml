@@ -1,0 +1,33 @@
+############ Large language model config ############
+OPENAI_API_TYPE: 'ollama' # 'openai' or 'azure' or 'ollama'
+
+# OpenAI settings
+OPENAI_KEY: 'ollama'
+OPENAI_CHAT_MODEL: null
+
+# Azure OpenAI settings
+AZURE_API_BASE: # https://xxxxxxx.openai.azure.com/
+AZURE_API_VERSION: "2023-07-01-preview"
+AZURE_API_KEY: #'xxxxxxx'
+AZURE_CHAT_DEPLOY_NAME: # chat model deployment name
+AZURE_EMBED_DEPLOY_NAME: # text embed model deployment name
+
+############# Local model / Ollama config ###############
+OLLAMA_API_BASE: 'http://localhost:11434/v1'
+OLLAMA_CHAT_MODEL: 'deepseek-r1:14b'
+OLLAMA_REFLECTION_MODEL: 'deepseek-r1:14b'
+OLLAMA_EMBED_MODEL: 'qwen3-embedding:8b'
+OLLAMA_API_KEY: 'ollama'
+
+############### DiLu settings ############
+reflection_module: True # True or False
+few_shot_num: 3 # 0 or 1 recommended for smaller local models
+episodes_num: 3
+memory_path: 'memories/qwen3_embed_8b'
+result_folder: 'results/deepseek-r1_14b'
+
+############ Highway-env config ############
+simulation_duration: 20
+vehicle_count: 15
+other_vehicle_type: "highway_env.vehicle.behavior.IDMVehicle"
+vehicles_density: 2.0

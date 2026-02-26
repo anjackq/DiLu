@@ -161,7 +161,7 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
 
 SGEnv/
 
@@ -189,16 +189,9 @@ highway_dqn/
 highway_ppo/
 DQN_GOOD_PERFORM/
 
-*.png
-
-*.pptx
-
 resources/
 exp/
 highway_ppo/
-
-*.pdf
-*.svg
 database/
 
 figs/
@@ -208,5 +201,18 @@ memories/
 archive/
 fine_tuning/checkpoints
 fine_tuning/merged_models
+fine_tuning/adapters/
 unsloth_compiled_cache
 config.yaml
+
+# DiLu local/generated artifacts
+examples/results/
+examples/memory_db/
+examples/memory_db_updated/
+models/
+outputs/
+gold_standard_data.jsonl
+
+# Optional local reports / plots (results/ is already ignored, these keep root clean)
+*_plot.png
+eval_compare_*.json
