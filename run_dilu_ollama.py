@@ -43,8 +43,10 @@ def setup_env(config):
         os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
         os.environ["OLLAMA_API_KEY"] = config['OLLAMA_API_KEY']
         os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
+        if config.get("OLLAMA_REFLECTION_MODEL"):
+            os.environ["OLLAMA_REFLECTION_MODEL"] = config["OLLAMA_REFLECTION_MODEL"]
 
-        print(f"[bold yellow]Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/bold yellow]")
+        print(f"[bold yellow]Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/bold yellow]")
     else:
         raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
 
@@ -125,6 +127,7 @@ if __name__ == '__main__':
         action = "Not available"
         docs = []
         collision_frame = -1
+        crashed = False
 
         try:
             already_decision_steps = 0
@@ -177,6 +180,7 @@ if __name__ == '__main__':
 
                 obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
+                crashed = bool(info.get("crashed", False))
 
                 already_decision_steps += 1
 
@@ -189,18 +193,17 @@ if __name__ == '__main__':
 
                 if done:
                     print(f"[red]Episode ended at step {i}. terminated={terminated}, truncated={truncated}, info={info}[/red]")
-                    print("[red]Simulation crash after running steps: [/red] ", i)
-                    collision_frame = i
+                    if crashed:
+                        print("[red]Simulation crash after running steps: [/red] ", i)
+                        collision_frame = i
+                    else:
+                        print("[yellow]Episode ended without collision (e.g., timeout/truncation).[/yellow]")
                     break
         finally:
 
             with open(result_folder + "/" + 'log.txt', 'a') as f:
                 f.write("Simulation {} | Seed {} | Steps: {} | File prefix: {} \n".format(
                     episode, seed, already_decision_steps, result_prefix))
-
-            with open(result_folder + "/" + 'log.txt', 'a') as f:
-                f.write(
-                    "Simulation {} | Seed {} | Steps: {} | File prefix: {} \n".format(episode, seed, already_decision_steps, result_prefix))
                 
             if REFLECTION:
                 print("[yellow]Now running reflection agent...[/yellow]")

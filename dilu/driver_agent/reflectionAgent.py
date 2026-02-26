@@ -29,11 +29,11 @@ class ReflectionAgent:
             # FORCE the Reflection Agent to use a smarter model
             # distinct from the driving model
             if "localhost" in base_url or "127.0.0.1" in base_url:
-                model_name = "deepseek-r1:14b"
+                model_name = os.getenv("OPENAI_REFLECTION_MODEL", "deepseek-r1:14b")
                 print(f"[yellow]Reflection Agent using Local Ollama: {model_name}[/yellow]")
             else:
                 # Default to strong GPT-4 for OpenAI reflection
-                model_name = 'gpt-4-1106-preview'
+                model_name = os.getenv("OPENAI_REFLECTION_MODEL", 'gpt-4-1106-preview')
                 print("[red]Cautious: Reflection mode uses OpenAI GPT-4, may cost a lot of money![/red]")
 
             self.llm = ChatOpenAI(
@@ -50,11 +50,11 @@ class ReflectionAgent:
             # FORCE the Reflection Agent to use a smarter model
             # distinct from the driving model
             if "localhost" in base_url or "127.0.0.1" in base_url:
-                model_name = "deepseek-r1:14b"
+                model_name = os.getenv("OLLAMA_REFLECTION_MODEL", "deepseek-r1:14b")
                 print(f"[yellow]Reflection Agent using Local Ollama: {model_name}[/yellow]")
             else:
                 # Default to strong GPT-4 for OpenAI reflection
-                model_name = 'gpt-4-1106-preview'
+                model_name = os.getenv("OPENAI_REFLECTION_MODEL", 'gpt-4-1106-preview')
                 print("[red]Cautious: Reflection mode uses OpenAI GPT-4, may cost a lot of money![/red]")
 
             self.llm = ChatOpenAI(
@@ -65,6 +65,8 @@ class ReflectionAgent:
                 max_tokens=1000,
                 request_timeout=60,
             )
+        else:
+            raise ValueError(f"Unknown OPENAI_API_TYPE: {oai_api_type}")
 
     def reflection(self, human_message: str, llm_response: str) -> str:
         delimiter = "####"

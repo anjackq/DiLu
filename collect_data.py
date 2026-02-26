@@ -183,9 +183,9 @@ def main():
 
                 # Create JSONL entry
                 json_row = {
-                    "instruction": "You are an expert autonomous driving agent. Analyze the scenario and checkpoints a JSON decision.",
+                    "instruction": "You are an expert autonomous driving agent. Analyze the scenario and output a JSON decision.",
                     "input": full_input,
-                    "checkpoints": json.dumps({
+                    "output": json.dumps({
                         "analysis": "Scenario analyzed via internal sensor data.",
                         "reasoning": reasoning,
                         "action_id": action_id

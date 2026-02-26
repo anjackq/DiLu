@@ -2,12 +2,12 @@ import json
 import os
 
 # --- CONFIGURATION ---
-INPUT_FILE = "fine_tuning/gold_standard_data.jsonl"
-OUTPUT_FILE = "fine_tuning/gold_standard_data_clean.jsonl"
+INPUT_FILE = "data/gold_standard_data.jsonl"
+OUTPUT_FILE = "data/gold_standard_data_clean.jsonl"
 
 # The new strict system prompt (Must match driverAgent.py)
 NEW_INSTRUCTION = """You are an autonomous driving decision engine.
-Analyze the scenario and checkpoints the single best Action_id integer (0-4).
+Analyze the scenario and output the single best Action_id integer (0-4).
 
 Strict Output Format:
 Reasoning: <one sentence>
@@ -42,8 +42,8 @@ def clean_and_convert():
                 if "Decision:" not in original_input:
                     original_input += "\nDecision:"
 
-                # 3. Parse the OLD checkpoints (which might be a JSON string or dict)
-                raw_output = entry.get("checkpoints", "")
+                # 3. Parse the old output/checkpoints payload (JSON string or dict)
+                raw_output = entry.get("output", entry.get("checkpoints", ""))
                 reasoning = ""
                 action_id = ""
 
@@ -72,7 +72,7 @@ def clean_and_convert():
                     new_entry = {
                         "instruction": NEW_INSTRUCTION,
                         "input": original_input,
-                        "checkpoints": new_output
+                        "output": new_output
                     }
 
                     # 6. Write to new file
