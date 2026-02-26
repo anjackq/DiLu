@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -20,6 +21,7 @@ DEFAULT_SEEDS = [
     5838, 2421, 7294, 9650, 4176, 6382, 8765, 1348,
     4213, 2572, 5678, 8587, 512, 7523, 6321, 5214, 31
 ]
+STRICT_RESPONSE_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*([0-4])\s*$", re.IGNORECASE)
 
 
 def setup_runtime_env(config: Dict, chat_model: str) -> None:
@@ -100,6 +102,31 @@ def _safe_int_action(action) -> int:
     return action
 
 
+def _response_format_metrics(response_content: str) -> Dict:
+    response_content = (response_content or "").strip()
+    has_delimiter = "####" in response_content
+    strict_match = STRICT_RESPONSE_PATTERN.search(response_content)
+    direct_action_parseable = False
+    parsed_action = None
+
+    if has_delimiter:
+        tail = response_content.split("####")[-1].strip()
+        try:
+            parsed_action = int(tail)
+            if 0 <= parsed_action <= 4:
+                direct_action_parseable = True
+        except Exception:
+            direct_action_parseable = False
+
+    return {
+        "has_delimiter": has_delimiter,
+        "strict_format_match": bool(strict_match),
+        "direct_action_parseable": direct_action_parseable,
+        "strict_action": int(strict_match.group(1)) if strict_match else None,
+        "direct_parsed_action": parsed_action,
+    }
+
+
 def run_episode(
     config: Dict,
     env_config: Dict,
@@ -118,6 +145,10 @@ def run_episode(
     terminated = False
     steps = 0
     final_info = {}
+    decisions_made = 0
+    responses_with_delimiter = 0
+    responses_strict_format = 0
+    responses_direct_parseable = 0
 
     try:
         env = gym.make(env_type, render_mode="rgb_array")
@@ -150,6 +181,11 @@ def run_episode(
                 fewshot_answers=fewshot_answers,
             )
             prev_action = action
+            decisions_made += 1
+            fmt = _response_format_metrics(response)
+            responses_with_delimiter += int(fmt["has_delimiter"])
+            responses_strict_format += int(fmt["strict_format_match"])
+            responses_direct_parseable += int(fmt["direct_action_parseable"])
 
             action = _safe_int_action(action)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -192,6 +228,10 @@ def run_episode(
         "success_no_collision": (error is None and not crashed),
         "episode_runtime_sec": round(duration_sec, 3),
         "avg_step_runtime_sec": round(duration_sec / max(steps, 1), 3),
+        "decisions_made": decisions_made,
+        "responses_with_delimiter": responses_with_delimiter,
+        "responses_strict_format": responses_strict_format,
+        "responses_direct_parseable": responses_direct_parseable,
         "error": error,
         "final_info": copy.deepcopy(final_info),
     }
@@ -206,6 +246,10 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     terminations = sum(1 for e in episodes if e["terminated"])
     total_steps = sum(e["steps"] for e in episodes)
     total_runtime = sum(e["episode_runtime_sec"] for e in episodes)
+    total_decisions = sum(e.get("decisions_made", 0) for e in episodes)
+    total_delimiters = sum(e.get("responses_with_delimiter", 0) for e in episodes)
+    total_strict = sum(e.get("responses_strict_format", 0) for e in episodes)
+    total_direct = sum(e.get("responses_direct_parseable", 0) for e in episodes)
 
     return {
         "model": model_name,
@@ -221,6 +265,10 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
         "avg_steps": round(total_steps / total, 2) if total else None,
         "avg_episode_runtime_sec": round(total_runtime / total, 3) if total else None,
         "avg_step_runtime_sec": round(total_runtime / max(total_steps, 1), 3),
+        "decisions_total": total_decisions,
+        "response_delimiter_rate": round(total_delimiters / total_decisions, 4) if total_decisions else None,
+        "response_strict_format_rate": round(total_strict / total_decisions, 4) if total_decisions else None,
+        "response_direct_parseable_rate": round(total_direct / total_decisions, 4) if total_decisions else None,
     }
 
 
@@ -308,7 +356,8 @@ def main() -> None:
         print(
             f"- {row['model']}: crashes={row['crashes']}/{row['episodes']} "
             f"(rate={row['crash_rate']}), no_collision_rate={row['no_collision_rate']}, "
-            f"avg_steps={row['avg_steps']}, avg_episode_runtime_sec={row['avg_episode_runtime_sec']}"
+            f"avg_steps={row['avg_steps']}, strict_format_rate={row['response_strict_format_rate']}, "
+            f"avg_episode_runtime_sec={row['avg_episode_runtime_sec']}"
         )
     print(f"\nSaved report: [bold]{out_path}[/bold]")
 

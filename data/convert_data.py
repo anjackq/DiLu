@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 # --- CONFIGURATION ---
 INPUT_FILE = "data/gold_standard_data.jsonl"
@@ -11,7 +12,42 @@ Analyze the scenario and output the single best Action_id integer (0-4).
 
 Strict Output Format:
 Reasoning: <one sentence>
-Action_id: <integer>"""
+Response to user:#### <integer>"""
+
+ACTION_PATTERN = re.compile(r"(?:Action_id\s*:\s*|Response to user:\s*####\s*)([0-4])", re.IGNORECASE)
+REASONING_PATTERN = re.compile(r"Reasoning\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_output_payload(raw_output):
+    """Extract reasoning + action_id from JSON payloads or already-converted text."""
+    reasoning = ""
+    action_id = None
+
+    if isinstance(raw_output, str):
+        # Try JSON first (common for the raw collected dataset)
+        try:
+            output_data = json.loads(raw_output)
+            reasoning = str(output_data.get("reasoning", "")).strip()
+            action_id = output_data.get("action_id", None)
+            return reasoning, action_id
+        except json.JSONDecodeError:
+            # Fall back to strict text parsing for re-conversion / mixed files
+            reasoning_match = REASONING_PATTERN.search(raw_output)
+            action_match = ACTION_PATTERN.search(raw_output)
+            if reasoning_match:
+                reasoning = reasoning_match.group(1).strip()
+                # Trim any trailing action section if present on next line(s)
+                reasoning = re.split(r"\n\s*(?:Action_id|Response to user)\s*:", reasoning, maxsplit=1)[0].strip()
+            if action_match:
+                action_id = action_match.group(1)
+            return reasoning, action_id
+
+    if isinstance(raw_output, dict):
+        reasoning = str(raw_output.get("reasoning", "")).strip()
+        action_id = raw_output.get("action_id", None)
+        return reasoning, action_id
+
+    return reasoning, action_id
 
 
 def clean_and_convert():
@@ -44,29 +80,22 @@ def clean_and_convert():
 
                 # 3. Parse the old output/checkpoints payload (JSON string or dict)
                 raw_output = entry.get("output", entry.get("checkpoints", ""))
-                reasoning = ""
-                action_id = ""
-
-                if isinstance(raw_output, str):
-                    try:
-                        # Try to parse nested JSON string: "{\"reasoning\":...}"
-                        output_data = json.loads(raw_output)
-                        reasoning = output_data.get("reasoning", "")
-                        action_id = output_data.get("action_id", "")
-                    except json.JSONDecodeError:
-                        # Maybe it's already text? Try simple split if needed,
-                        # or skip if format is too weird.
-                        skipped_count += 1
-                        continue
-                elif isinstance(raw_output, dict):
-                    # It was already a dict
-                    reasoning = raw_output.get("reasoning", "")
-                    action_id = raw_output.get("action_id", "")
+                reasoning, action_id = _parse_output_payload(raw_output)
 
                 # 4. Create NEW Strict Output String
-                # Format: "Reasoning: ...\nAction_id: ..."
+                # Format must align with DriverAgent parser:
+                # "Reasoning: ...\nResponse to user:#### <int>"
                 if action_id is not None:
-                    new_output = f"Reasoning: {reasoning}\nAction_id: {action_id}"
+                    try:
+                        action_id = int(action_id)
+                    except (ValueError, TypeError):
+                        skipped_count += 1
+                        continue
+                    if action_id < 0 or action_id > 4:
+                        skipped_count += 1
+                        continue
+                    reasoning = reasoning or "Scenario analyzed and best action selected."
+                    new_output = f"Reasoning: {reasoning}\nResponse to user:#### {action_id}"
 
                     # 5. Build New Entry
                     new_entry = {
@@ -88,6 +117,10 @@ def clean_and_convert():
     print(f"Done! Converted {converted_count} samples.")
     print(f"Skipped {skipped_count} invalid samples.")
     print(f"New file saved to: {OUTPUT_FILE}")
+    if converted_count > 0:
+        print("Validation target format:")
+        print("- Output contains a 'Reasoning:' line")
+        print("- Output ends with 'Response to user:#### <0-4>'")
 
 
 if __name__ == "__main__":

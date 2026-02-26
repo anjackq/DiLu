@@ -1,4 +1,5 @@
 import os
+import re
 import textwrap
 import time
 from rich import print
@@ -13,6 +14,7 @@ from langchain_core.callbacks import StreamingStdOutCallbackHandler
 from dilu.scenario.envScenario import EnvScenario
 
 delimiter = "####"
+ACTION_RECOVERY_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*(?:<[^>]+>\s*)?([0-4])\s*$", re.IGNORECASE | re.MULTILINE)
 # ... (Keep example_message and example_answer variables as they are in original) ...
 example_message = textwrap.dedent(f"""\
         {delimiter} Driving scenario description:
@@ -116,7 +118,11 @@ class DriverAgent:
 
         **Answer:**
         Reasoning: [1-sentence summary of the conclusion]
-        Response to user:{delimiter} <Action_id_integer>
+        Response to user:{delimiter} 4
+
+        IMPORTANT:
+        - Output a real integer (0-4), not a placeholder.
+        - Do NOT output angle brackets like <Action_id_integer>.
         """)
 
         human_message = f"""\
@@ -167,36 +173,43 @@ class DriverAgent:
         print("\n")
         decision_action = response_content.split(delimiter)[-1]
         try:
-            result = int(decision_action)
+            result = int(decision_action.strip())
             if result < 0 or result > 4:
                 raise ValueError
         except ValueError:
-            print("Output is not a int number, checking the output...")
-            check_message = f"""
-            You are a output checking assistant who is responsible for checking the output of another agent.
+            # Common SLM failure mode: emits placeholder line and then the real integer on the next line.
+            # Recover locally before spending another LLM call on the checker.
+            matches = ACTION_RECOVERY_PATTERN.findall(response_content)
+            if matches:
+                result = int(matches[-1])
+                print(f"[yellow]Recovered action via regex parse:[/yellow] {result}")
+            else:
+                print("Output is not a int number, checking the output...")
+                check_message = f"""
+                You are a output checking assistant who is responsible for checking the output of another agent.
 
-            The output you received is: {decision_action}
+                The output you received is: {decision_action}
 
-            Your should just output the right int type of action_id, with no other characters or delimiters.
-            i.e. :
-            | Action_id | Action Description                                     |
-            |--------|--------------------------------------------------------|
-            | 0      | Turn-left: change lane to the left of the current lane |
-            | 1      | IDLE: remain in the current lane with current speed   |
-            | 2      | Turn-right: change lane to the right of the current lane|
-            | 3      | Acceleration: accelerate the vehicle                 |
-            | 4      | Deceleration: decelerate the vehicle                 |
+                Your should just output the right int type of action_id, with no other characters or delimiters.
+                i.e. :
+                | Action_id | Action Description                                     |
+                |--------|--------------------------------------------------------|
+                | 0      | Turn-left: change lane to the left of the current lane |
+                | 1      | IDLE: remain in the current lane with current speed   |
+                | 2      | Turn-right: change lane to the right of the current lane|
+                | 3      | Acceleration: accelerate the vehicle                 |
+                | 4      | Deceleration: decelerate the vehicle                 |
 
 
-            You answer format would be:
-            {delimiter} <correct action_id within 0-4>
-            """
-            messages = [
-                HumanMessage(content=check_message),
-            ]
-            with get_openai_callback() as cb:
-                check_response = self.llm.invoke(messages)  # Changed from self.llm(messages)
-            result = int(check_response.content.split(delimiter)[-1])
+                You answer format would be:
+                {delimiter} <correct action_id within 0-4>
+                """
+                messages = [
+                    HumanMessage(content=check_message),
+                ]
+                with get_openai_callback() as cb:
+                    check_response = self.llm.invoke(messages)  # Changed from self.llm(messages)
+                result = int(check_response.content.split(delimiter)[-1])
 
         few_shot_answers_store = ""
         for i in range(len(fewshot_messages)):

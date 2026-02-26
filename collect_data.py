@@ -89,6 +89,36 @@ def get_expert_decision(sce):
             reasoning = f"Safety Critical: Front vehicle is {front_dist:.1f}m ahead. Decelerating to avoid collision."
             return action, reasoning
 
+    def lane_change_safe(target_lane_id):
+        """
+        Basic safety check for lane changes using nearest front/rear vehicles in target lane.
+        Returns (is_safe: bool, reason: str)
+        """
+        current_lane = vehicle.lane_index
+        target_lane_index = (current_lane[0], current_lane[1], target_lane_id)
+        try:
+            target_front, target_rear = road.neighbour_vehicles(vehicle, target_lane_index)
+        except Exception:
+            return False, "Could not query target-lane neighbors."
+
+        if target_front is not None:
+            front_gap = np.linalg.norm(vehicle.position - target_front.position)
+            front_rel_speed = vehicle.speed - target_front.speed
+            if front_gap < 15:
+                return False, f"Target lane front gap too small ({front_gap:.1f}m)."
+            if front_gap < 25 and front_rel_speed > 0:
+                return False, f"Target lane front vehicle too close/slower ({front_gap:.1f}m)."
+
+        if target_rear is not None:
+            rear_gap = np.linalg.norm(vehicle.position - target_rear.position)
+            rear_closing_speed = target_rear.speed - vehicle.speed
+            if rear_gap < 10:
+                return False, f"Target lane rear gap too small ({rear_gap:.1f}m)."
+            if rear_gap < 20 and rear_closing_speed > 2.0:
+                return False, f"Rear vehicle approaching too quickly ({rear_gap:.1f}m, +{rear_closing_speed:.1f}m/s)."
+
+        return True, "Target lane appears safe for lane change."
+
     # --- EFFICIENCY CHECK (Overtaking & Speed) ---
     TARGET_SPEED = 28.0  # ~100 km/h
 
@@ -100,17 +130,24 @@ def get_expert_decision(sce):
 
         # Try Left (if not already leftmost)
         if current_lane_id > 0:
-            # In a real expert, we would check if the target lane is safe.
-            # For simplicity, we assume the environment handles basic collision checks,
-            # or we rely on the fact that 'stuck' implies we should try to move.
-            action = 0  # LANE_LEFT
-            reasoning = "Impeded by slower vehicle. Changing lane to left to maintain efficiency."
-            return action, reasoning
+            safe_left, left_reason = lane_change_safe(current_lane_id - 1)
+            if safe_left:
+                action = 0  # LANE_LEFT
+                reasoning = "Impeded by slower vehicle. Left lane is safe, changing lane to maintain efficiency."
+                return action, reasoning
 
         # Try Right (if not rightmost)
-        elif current_lane_id < 3:
-            action = 2  # LANE_RIGHT
-            reasoning = "Impeded by slower vehicle. Changing lane to right to maintain efficiency."
+        if current_lane_id < 3:
+            safe_right, right_reason = lane_change_safe(current_lane_id + 1)
+            if safe_right:
+                action = 2  # LANE_RIGHT
+                reasoning = "Impeded by slower vehicle. Right lane is safe, changing lane to maintain efficiency."
+                return action, reasoning
+
+        # If no safe lane change exists, slow down rather than forcing a risky maneuver.
+        if front_vehicle and front_dist < 25:
+            action = 4
+            reasoning = "Blocked by slower traffic and no safe lane change gap available. Decelerating."
             return action, reasoning
 
     # If free road and slow, accelerate
