@@ -45,7 +45,7 @@ conda activate dilu
 pip install -r requirements.txt
 ```
 
-📝 **Note:** DiLu requires specific versions of certain libraries **(i.e. `langchain==0.0.335`, `openai==0.28.1`, `chromadb==0.3.29`)**, Please adhere to the versions specified in  `requirements.txt`.
+📝 **Note:** This fork uses a newer local/Ollama-compatible dependency stack in `requirements.txt` (LangChain split packages + newer OpenAI/Chroma versions).
 
 ### 2. Configuration ⚙️ 
 
@@ -72,9 +72,11 @@ AZURE_EMBED_DEPLOY_NAME: # text embed model deployment name
 
 Running DiLu is straightforward:
 ```bash
-python run_dilu.py
+python run_dilu_ollama.py
 ```
 The default setting runs a 3-shot simulation with different seeds. You can modify this in `config.yaml`.
+
+📝 **Fork Note:** This fork is maintained around the local-model/Ollama workflow. The original `run_dilu.py` has been moved to `archive/run_dilu.py` as a legacy script.
 
 After completing the simulations, check the `results` folder. `log.txt` contains detailed steps and seeds for each simulation, and all simulation videos are saved here too.
 
@@ -99,10 +101,10 @@ This fork adds support for running DiLu with local open-source models via Ollama
 
 ### Local Ollama Runtime
 
-Use the Ollama-specific requirements (newer LangChain/OpenAI client stack):
+Use the project requirements (this fork now uses a single `requirements.txt`):
 
 ```bash
-pip install -r requirements_ollama.txt
+pip install -r requirements.txt
 ```
 
 Create a local config from the tracked template and customize it:
@@ -131,6 +133,7 @@ Generate training data (rule-based expert labels from DiLu scenarios):
 ```bash
 python collect_data.py
 ```
+This writes `data/gold_standard_data.jsonl`.
 
 Convert data to the strict instruction/output format used by the training scripts:
 

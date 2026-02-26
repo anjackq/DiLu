@@ -1,18 +1,14 @@
-gymnasium==0.28.1
+gymnasium==0.29.1
 highway-env==1.8.2
-langchain==0.0.335
-#langchain>=0.1.0
-#langchain-community
-#langchain-openai
-openai==0.28.1
-chromadb==0.3.29
-matplotlib==3.7.1
-numpy==1.24.3
-#numpy
-PyYAML==6.0
-#PyYAML
-gradio==3.36.0
-gradio_client==0.2.7
+langchain>=0.1.0
+langchain-community
+langchain-openai
+openai>=1.10.0         # Critical: Allows "client = OpenAI()" syntax
+chromadb>=0.4.22       # Critical: Fixes the build error you saw
+matplotlib
+numpy<2.0.0            # Prevents breaking older libraries
+PyYAML
+gradio                 # Let it pick a stable modern version
 rich
 moviepy
 tiktoken

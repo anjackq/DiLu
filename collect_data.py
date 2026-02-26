@@ -13,7 +13,7 @@ from dilu.scenario.envScenario import EnvScenario
 
 # --- CONFIGURATION ---
 TOTAL_EPISODES = 50  # Number of successful episodes to collect
-OUTPUT_FILE = "gold_standard_data.jsonl"
+OUTPUT_FILE = "data/gold_standard_data.jsonl"
 # Seeds matching run_dilu.py for consistency
 SEEDS = [5838, 2421, 7294, 9650, 4176, 6382, 8765, 1348, 4213, 2572, 5678, 8587, 512, 7523, 6321, 5214, 31]
 
@@ -141,6 +141,9 @@ def main():
 
     pbar = tqdm(total=TOTAL_EPISODES)
     episode_count = 0
+
+    # Ensure output directory and temp directory exist
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
     # Ensure a temp directory for DBs exists
     if not os.path.exists('temp_dbs'):

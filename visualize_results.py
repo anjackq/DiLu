@@ -30,7 +30,7 @@ elif config['OPENAI_API_TYPE'] == 'ollama':
     os.environ["OPENAI_API_KEY"] = "ollama"
     os.environ["OPENAI_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
     os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
-    print(f"[bold yellow]Visualizer Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/bold yellow]")
+    print(f"[bold yellow]Visualizer Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/bold yellow]")
 else:
     raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
 

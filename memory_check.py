@@ -12,13 +12,13 @@ except FileNotFoundError:
 
 # 2. Setup Environment Variables (Critical Step)
 if config['OPENAI_API_TYPE'] == 'ollama':
-    # Trick the system into thinking it's OpenAI, but point to localhost
-    os.environ["OPENAI_API_TYPE"] = 'openai'
-    os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
-    os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
-    os.environ["OPENAI_API_KEY"] = "ollama"
-    os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
-    print(f"[yellow]Configured for Local Ollama: {config['OPENAI_CHAT_MODEL']}[/yellow]")
+    os.environ["OPENAI_API_TYPE"] = 'ollama'
+    os.environ["OLLAMA_API_BASE"] = config.get("OLLAMA_API_BASE", "http://localhost:11434/v1")
+    os.environ["OPENAI_BASE_URL"] = os.environ["OLLAMA_API_BASE"]
+    os.environ["OLLAMA_API_KEY"] = config.get("OLLAMA_API_KEY", "ollama")
+    os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
+    os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
+    print(f"[yellow]Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/yellow]")
 
 elif config['OPENAI_API_TYPE'] == 'openai':
     os.environ["OPENAI_API_TYPE"] = 'openai'
@@ -49,4 +49,4 @@ try:
 
 except Exception as e:
     print(f"[red]Error loading memory:[/red] {e}")
-    print("[yellow]Hint: If you are using Ollama with the default '20_mem' folder, it will likely fail due to dimension mismatch (1536 vs 5120). You should delete the 'memories' folder to let Ollama create a fresh one.[/yellow]")
+    print("[yellow]Hint: Embedding dimension mismatches are common when switching models/providers. Use a separate memory folder per embedding model (for example, `memories/qwen3_embed_8b`).[/yellow]")
