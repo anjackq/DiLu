@@ -1,4 +1,3 @@
-import os
 import re
 from rich import print
 import gradio as gr
@@ -6,33 +5,14 @@ import yaml
 import argparse
 from dilu.scenario.envScenarioReplay import EnvScenarioReplay
 from dilu.driver_agent.vectorStore import DrivingMemory
+from dilu.runtime import configure_runtime_env
 
 config = yaml.load(open('config.yaml'), Loader=yaml.FullLoader)
 
 # --- Configuration Setup ---
-if config['OPENAI_API_TYPE'] == 'azure':
-    os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
-    os.environ["OPENAI_API_VERSION"] = config['AZURE_API_VERSION']
-    os.environ["OPENAI_API_BASE"] = config['AZURE_API_BASE']
-    os.environ["OPENAI_API_KEY"] = config['AZURE_API_KEY']
-    os.environ["AZURE_CHAT_DEPLOY_NAME"] = config['AZURE_CHAT_DEPLOY_NAME']
-    os.environ["AZURE_EMBED_DEPLOY_NAME"] = config['AZURE_EMBED_DEPLOY_NAME']
-elif config['OPENAI_API_TYPE'] == 'openai':
-    os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
-    os.environ["OPENAI_API_KEY"] = config['OPENAI_KEY']
-    os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
-# [NEW] Added Ollama Support
-elif config['OPENAI_API_TYPE'] == 'ollama':
-    os.environ["OPENAI_API_TYPE"] = 'openai'
-    # Set both legacy and new base URL vars for maximum compatibility
-    os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
-    os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
-    os.environ["OPENAI_API_KEY"] = "ollama"
-    os.environ["OPENAI_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
-    os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
-    print(f"[bold yellow]Visualizer Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/bold yellow]")
-else:
-    raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
+selected_model = configure_runtime_env(config)
+if config['OPENAI_API_TYPE'] == 'ollama':
+    print(f"[bold yellow]Visualizer Configured for Local Ollama: {selected_model}[/bold yellow]")
 
 TAMDTemplate = """
 # Thoughts and Actions

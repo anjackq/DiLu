@@ -87,6 +87,11 @@ After completing the simulations, check the `results` folder. `log.txt` contains
 
 To activate the reflection module, set `reflection_module` to True in `config.yaml`. New memory items will be saved to the updated memory module.
 
+For unattended runs (for example VS Code debug runs, long batches, or eval scripts), you can disable reflection prompts:
+- `reflection_interactive: False`
+- `reflection_auto_add: True` (optional, auto-commit new memory items)
+- `reflection_add_every_n: 5` (controls non-collision sampling cadence)
+
 ## 4. Visualizing Results 📊
 
 We provide a visualization scripts for the simulation result.

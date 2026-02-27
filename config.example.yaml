@@ -21,6 +21,9 @@ OLLAMA_API_KEY: 'ollama'
 
 ############### DiLu settings ############
 reflection_module: True # True or False
+reflection_interactive: True # If False, disable Y/N terminal prompts in reflection flow
+reflection_auto_add: False # If True, auto-commit reflection memories without prompts
+reflection_add_every_n: 5 # In non-collision runs, add one memory every N frames (uses i % N == 1)
 few_shot_num: 3 # 0 or 1 recommended for smaller local models
 episodes_num: 3
 memory_path: 'memories/qwen3_embed_8b'

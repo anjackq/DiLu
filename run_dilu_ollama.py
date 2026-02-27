@@ -14,6 +14,12 @@ from dilu.scenario.envScenario import EnvScenario
 from dilu.driver_agent.driverAgent import DriverAgent
 from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.driver_agent.reflectionAgent import ReflectionAgent
+from dilu.runtime import (
+    configure_runtime_env,
+    build_highway_env_config,
+    DEFAULT_DILU_SEEDS,
+    ensure_dir,
+)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -28,8 +34,14 @@ except ImportError:
     PYGAME_AVAILABLE = False
 
 
-test_list_seed = [5838, 2421, 7294, 9650, 4176, 6382, 8765, 1348,
-                  4213, 2572, 5678, 8587, 512, 7523, 6321, 5214, 31]
+def _to_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 class TelemetryHUDWrapper(gym.Wrapper):
@@ -300,66 +312,15 @@ def print_ego_telemetry(step_idx: int, telemetry: dict):
 
 
 def setup_env(config):
-    if config['OPENAI_API_TYPE'] == 'azure':
-        os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
-        os.environ["OPENAI_API_VERSION"] = config['AZURE_API_VERSION']
-        os.environ["OPENAI_API_BASE"] = config['AZURE_API_BASE']
-        os.environ["OPENAI_API_KEY"] = config['AZURE_API_KEY']
-        os.environ["AZURE_CHAT_DEPLOY_NAME"] = config['AZURE_CHAT_DEPLOY_NAME']
-        os.environ["AZURE_EMBED_DEPLOY_NAME"] = config['AZURE_EMBED_DEPLOY_NAME']
-    elif config['OPENAI_API_TYPE'] == 'openai':
-        os.environ["OPENAI_API_TYPE"] = config['OPENAI_API_TYPE']
-        os.environ["OPENAI_API_KEY"] = config['OPENAI_KEY']
-        os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
-    # [NEW] ADDED OLLAMA SUPPORT HERE
-    elif config['OPENAI_API_TYPE'] == 'ollama':
-        # We trick the system into thinking it is OpenAI, but point to localhost
-        os.environ["OPENAI_API_TYPE"] = 'ollama'
-        #os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
-        #os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
-        #os.environ["OPENAI_API_KEY"] = "ollama"  # Dummy key
-        #os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
-        os.environ["OLLAMA_API_BASE"] = config['OLLAMA_API_BASE']
-        os.environ["OPENAI_BASE_URL"] = config['OLLAMA_API_BASE']
-        os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
-        os.environ["OLLAMA_API_KEY"] = config['OLLAMA_API_KEY']
-        os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
-        if config.get("OLLAMA_REFLECTION_MODEL"):
-            os.environ["OLLAMA_REFLECTION_MODEL"] = config["OLLAMA_REFLECTION_MODEL"]
+    selected_model = configure_runtime_env(config)
+    if config['OPENAI_API_TYPE'] == 'ollama':
+        print(f"[bold yellow]Configured for Local Ollama: {selected_model}[/bold yellow]")
 
-        print(f"[bold yellow]Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/bold yellow]")
-    else:
-        raise ValueError("Unknown OPENAI_API_TYPE, should be azure, openai, or ollama")
-
-    # environment setting
-    env_config = {
-        'highway-v0':
-        {
-            "observation": {
-                "type": "Kinematics",
-                "features": ["presence", "x", "y", "vx", "vy"],
-                "absolute": True,
-                "normalize": False,
-                "vehicles_count": config["vehicle_count"],
-                "see_behind": True,
-            },
-            "action": {
-                "type": "DiscreteMetaAction",
-                "target_speeds": np.linspace(5, 32, 9),
-            },
-            "lanes_count": 4,
-            "other_vehicles_type": config["other_vehicle_type"],
-            "duration": config["simulation_duration"],
-            "vehicles_density": config["vehicles_density"],
-            "show_trajectories": True,
-            "render_agent": True,
-            "scaling": 5,
-            'initial_lane_id': None,
-            "ego_spacing": 4,
-        }
-    }
-
-    return env_config
+    return build_highway_env_config(
+        config,
+        show_trajectories=True,
+        render_agent=True,
+    )
 
 
 if __name__ == '__main__':
@@ -370,14 +331,22 @@ if __name__ == '__main__':
     env_config = setup_env(config)
 
     REFLECTION = config["reflection_module"]
+    reflection_interactive = _to_bool(config.get("reflection_interactive", True), default=True)
+    reflection_auto_add = _to_bool(config.get("reflection_auto_add", False), default=False)
+    reflection_add_every_n = int(config.get("reflection_add_every_n", 5))
+    if reflection_add_every_n <= 0:
+        reflection_add_every_n = 1
     memory_path = config["memory_path"]
     few_shot_num = config["few_shot_num"]
     result_folder = config["result_folder"]
-    if not os.path.exists(result_folder):
-        os.makedirs(result_folder)
-    with open(result_folder + "/" + 'log.txt', 'w') as f:
+    ensure_dir(result_folder)
+    log_path = os.path.join(result_folder, "log.txt")
+    with open(log_path, 'w') as f:
         f.write("memory_path {} | result_folder {} | few_shot_num: {} | lanes_count: {} \n".format(
             memory_path, result_folder, few_shot_num, env_config['highway-v0']['lanes_count']))
+        f.write("reflection_module {} | reflection_interactive {} | reflection_auto_add {} | reflection_add_every_n {} \n".format(
+            REFLECTION, reflection_interactive, reflection_auto_add, reflection_add_every_n
+        ))
 
     agent_memory = DrivingMemory(db_path=memory_path)
     if REFLECTION:
@@ -394,12 +363,12 @@ if __name__ == '__main__':
         result_prefix = f"highway_{episode}"
         env = RecordVideo(env, result_folder, name_prefix=result_prefix)
         env.unwrapped.set_record_video_wrapper(env)
-        seed = random.choice(test_list_seed)
+        seed = random.choice(DEFAULT_DILU_SEEDS)
         obs, info = env.reset(seed=seed)
         env.render()
 
         # scenario and driver agent setting
-        database_path = result_folder + "/" + result_prefix + ".db"
+        database_path = os.path.join(result_folder, f"{result_prefix}.db")
         sce = EnvScenario(env, envType, seed, database_path)
         DA = DriverAgent(sce, verbose=True)
         if REFLECTION:
@@ -427,9 +396,6 @@ if __name__ == '__main__':
                         fewshot_result["human_question"])
                     fewshot_answers.append(fewshot_result["LLM_response"])
                     fewshot_actions.append(fewshot_result["action"])
-                    mode_action = max(
-                        set(fewshot_actions), key=fewshot_actions.count)
-                    mode_action_count = fewshot_actions.count(mode_action)
                 if few_shot_num == 0:
                     print("[yellow]Now in the zero-shot mode, no few-shot memories.[/yellow]")
                 else:
@@ -485,7 +451,7 @@ if __name__ == '__main__':
                     break
         finally:
 
-            with open(result_folder + "/" + 'log.txt', 'a') as f:
+            with open(log_path, 'a') as f:
                 f.write("Simulation {} | Seed {} | Steps: {} | File prefix: {} \n".format(
                     episode, seed, already_decision_steps, result_prefix))
                 
@@ -496,8 +462,14 @@ if __name__ == '__main__':
                         if docs[i]["action"] != 4:  # not decelearate
                             corrected_response = RA.reflection(
                                 docs[i]["human_question"], docs[i]["response"])
-                            
-                            choice = input("[yellow]Do you want to add this new memory item to update memory module? (Y/N): ").strip().upper()
+
+                            if reflection_auto_add:
+                                choice = 'Y'
+                            elif reflection_interactive:
+                                choice = input("[yellow]Do you want to add this new memory item to update memory module? (Y/N): ").strip().upper()
+                            else:
+                                choice = 'N'
+
                             if choice == 'Y':
                                 updated_memory.addMemory(
                                     docs[i]["sce_descrip"],
@@ -513,12 +485,18 @@ if __name__ == '__main__':
                                 print("[blue]Ignore this new memory item[/blue]")
                             break
                 else:
-                    print("[yellow]Do you want to add[/yellow]",len(docs)//5, "[yellow]new memory item to update memory module?[/yellow]",end="")
-                    choice = input("(Y/N): ").strip().upper()
+                    planned_additions = len(docs) // reflection_add_every_n
+                    print("[yellow]Do you want to add[/yellow]", planned_additions, "[yellow]new memory item to update memory module?[/yellow]", end="")
+                    if reflection_auto_add:
+                        choice = 'Y'
+                    elif reflection_interactive:
+                        choice = input("(Y/N): ").strip().upper()
+                    else:
+                        choice = 'N'
                     if choice == 'Y':
                         cnt = 0
                         for i in range(0, len(docs)):
-                            if i % 5 == 1:
+                            if i % reflection_add_every_n == 1:
                                 updated_memory.addMemory(
                                     docs[i]["sce_descrip"],
                                     docs[i]["human_question"],

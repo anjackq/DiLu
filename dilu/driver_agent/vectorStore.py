@@ -1,6 +1,7 @@
 import os
 import textwrap
 from rich import print
+import json
 
 # UPDATED IMPORTS: Adapting to LangChain v0.1+
 from langchain_community.vectorstores import Chroma
@@ -61,7 +62,7 @@ class DrivingMemory:
                 )
 
             else:
-                raise ValueError("Unknown OPENAI_API_TYPE: should be azure or openai")
+                raise ValueError("Unknown OPENAI_API_TYPE: should be azure, openai, or ollama")
 
             # Define DB path
             db_path = os.path.join('./db', 'chroma_5_shot_20_mem/') if db_path is None else db_path
@@ -136,39 +137,45 @@ class DrivingMemory:
         current_documents = self.scenario_memory._collection.get(
             include=['documents', 'metadatas', 'embeddings'])
 
-        # --- FIX START: Safe handling of embeddings ---
-        current_embeddings = current_documents.get('embeddings')
-        if current_embeddings is None:
-            current_embeddings = []
-        # Convert to list if it's a numpy array to prevent comparison errors
-        elif hasattr(current_embeddings, 'tolist'):
-            current_embeddings = current_embeddings.tolist()
+        def _safe_signature(doc, metadata):
+            return (doc or "") + "||" + json.dumps(metadata or {}, sort_keys=True)
 
-        other_embeddings = other_documents.get('embeddings')
-        if other_embeddings is None:
-            other_embeddings = []
-        elif hasattr(other_embeddings, 'tolist'):
+        current_ids = set(current_documents.get('ids') or [])
+        current_sigs = set()
+        current_docs = current_documents.get('documents') or []
+        current_meta = current_documents.get('metadatas') or []
+        for i in range(min(len(current_docs), len(current_meta))):
+            current_sigs.add(_safe_signature(current_docs[i], current_meta[i]))
+
+        other_embeddings = other_documents.get('embeddings') or []
+        if hasattr(other_embeddings, 'tolist'):
             other_embeddings = other_embeddings.tolist()
-        # --- FIX END ---
+        other_ids = other_documents.get('ids') or []
+        other_docs = other_documents.get('documents') or []
+        other_meta = other_documents.get('metadatas') or []
 
-        # Iterate and merge
+        merged = 0
+        skipped = 0
         for i in range(len(other_embeddings)):
-            # Check if embedding already exists in current memory
-            if other_embeddings[i] in current_embeddings:
-                # Optional: reduce verbosity if needed
-                # print("Already have one memory item, skip.")
-                pass
-            else:
-                self.scenario_memory._collection.add(
-                    embeddings=[other_embeddings[i]],  # Must be a list
-                    metadatas=[other_documents['metadatas'][i]],
-                    documents=[other_documents['documents'][i]],
-                    ids=[other_documents['ids'][i]]
-                )
+            candidate_id = other_ids[i]
+            candidate_sig = _safe_signature(other_docs[i], other_meta[i])
+            if candidate_id in current_ids or candidate_sig in current_sigs:
+                skipped += 1
+                continue
+
+            self.scenario_memory._collection.add(
+                embeddings=[other_embeddings[i]],  # Must be a list
+                metadatas=[other_meta[i]],
+                documents=[other_docs[i]],
+                ids=[candidate_id]
+            )
+            current_ids.add(candidate_id)
+            current_sigs.add(candidate_sig)
+            merged += 1
 
         # Safe count check
         count = self.scenario_memory._collection.count()
-        print("Merge complete. Now the database has ", count, " items.")
+        print("Merge complete. Added", merged, "items, skipped", skipped, "duplicates. Now the database has", count, "items.")
 
 
 if __name__ == "__main__":

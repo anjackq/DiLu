@@ -14,75 +14,31 @@ from rich import print
 
 from dilu.driver_agent.driverAgent import DriverAgent
 from dilu.driver_agent.vectorStore import DrivingMemory
+from dilu.runtime import (
+    configure_runtime_env,
+    build_highway_env_config,
+    DEFAULT_DILU_SEEDS,
+    ensure_dir,
+    ensure_parent_dir,
+    timestamped_results_path,
+)
 from dilu.scenario.envScenario import EnvScenario
 
 
-DEFAULT_SEEDS = [
-    5838, 2421, 7294, 9650, 4176, 6382, 8765, 1348,
-    4213, 2572, 5678, 8587, 512, 7523, 6321, 5214, 31
-]
 STRICT_RESPONSE_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*([0-4])\s*$", re.IGNORECASE)
 
 
-def setup_runtime_env(config: Dict, chat_model: str) -> None:
-    api_type = config["OPENAI_API_TYPE"]
-    if api_type == "azure":
-        os.environ["OPENAI_API_TYPE"] = "azure"
-        os.environ["OPENAI_API_VERSION"] = str(config["AZURE_API_VERSION"])
-        os.environ["OPENAI_API_BASE"] = str(config["AZURE_API_BASE"])
-        os.environ["OPENAI_API_KEY"] = str(config["AZURE_API_KEY"])
-        os.environ["AZURE_CHAT_DEPLOY_NAME"] = str(config["AZURE_CHAT_DEPLOY_NAME"])
-        os.environ["AZURE_EMBED_DEPLOY_NAME"] = str(config["AZURE_EMBED_DEPLOY_NAME"])
-    elif api_type == "openai":
-        os.environ["OPENAI_API_TYPE"] = "openai"
-        os.environ["OPENAI_API_KEY"] = str(config["OPENAI_KEY"])
-        os.environ["OPENAI_CHAT_MODEL"] = chat_model
-        if config.get("OPENAI_REFLECTION_MODEL"):
-            os.environ["OPENAI_REFLECTION_MODEL"] = str(config["OPENAI_REFLECTION_MODEL"])
-    elif api_type == "ollama":
-        os.environ["OPENAI_API_TYPE"] = "ollama"
-        os.environ["OLLAMA_API_BASE"] = str(config["OLLAMA_API_BASE"])
-        os.environ["OPENAI_BASE_URL"] = str(config["OLLAMA_API_BASE"])
-        os.environ["OLLAMA_CHAT_MODEL"] = chat_model
-        os.environ["OLLAMA_API_KEY"] = str(config["OLLAMA_API_KEY"])
-        os.environ["OLLAMA_EMBED_MODEL"] = str(config["OLLAMA_EMBED_MODEL"])
-        if config.get("OLLAMA_REFLECTION_MODEL"):
-            os.environ["OLLAMA_REFLECTION_MODEL"] = str(config["OLLAMA_REFLECTION_MODEL"])
-    else:
-        raise ValueError(f"Unsupported OPENAI_API_TYPE: {api_type}")
-
-
 def build_env_config(config: Dict) -> Dict:
-    return {
-        "highway-v0": {
-            "observation": {
-                "type": "Kinematics",
-                "features": ["presence", "x", "y", "vx", "vy"],
-                "absolute": True,
-                "normalize": False,
-                "vehicles_count": config["vehicle_count"],
-                "see_behind": True,
-            },
-            "action": {
-                "type": "DiscreteMetaAction",
-                "target_speeds": np.linspace(5, 32, 9),
-            },
-            "lanes_count": 4,
-            "other_vehicles_type": config["other_vehicle_type"],
-            "duration": config["simulation_duration"],
-            "vehicles_density": config["vehicles_density"],
-            "show_trajectories": False,
-            "render_agent": False,
-            "scaling": 5,
-            "initial_lane_id": None,
-            "ego_spacing": 4,
-        }
-    }
+    return build_highway_env_config(
+        config,
+        show_trajectories=False,
+        render_agent=False,
+    )
 
 
 def parse_seeds(raw: Optional[str]) -> List[int]:
     if not raw:
-        return DEFAULT_SEEDS
+        return DEFAULT_DILU_SEEDS
     seeds = []
     for token in raw.split(","):
         token = token.strip()
@@ -297,9 +253,8 @@ def main() -> None:
         config["memory_path"] = args.memory_path
 
     env_config = build_env_config(config)
-    temp_dir = os.path.join("temp", "eval_compare")
-    os.makedirs(temp_dir, exist_ok=True)
-    os.makedirs("results", exist_ok=True)
+    temp_dir = ensure_dir(os.path.join("temp", "eval_compare"))
+    ensure_dir("results")
 
     report = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -316,7 +271,7 @@ def main() -> None:
 
     for model_name in args.models:
         print(f"\n[bold cyan]Evaluating model[/bold cyan]: {model_name}")
-        setup_runtime_env(config, model_name)
+        configure_runtime_env(config, chat_model_override=model_name)
         agent_memory = DrivingMemory(db_path=config["memory_path"])
 
         episodes = []
@@ -343,10 +298,9 @@ def main() -> None:
         report["aggregates"].append(aggregate_results(model_name, episodes))
 
     if args.output:
-        out_path = args.output
+        out_path = ensure_parent_dir(args.output)
     else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join("results", f"eval_compare_{ts}.json")
+        out_path = timestamped_results_path("eval_compare", ext=".json", results_dir="results")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)

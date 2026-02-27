@@ -1,7 +1,7 @@
-import os
 import yaml
 from rich import print
 from dilu.driver_agent.vectorStore import DrivingMemory
+from dilu.runtime import configure_runtime_env
 
 # 1. Load the configuration
 try:
@@ -11,24 +11,9 @@ except FileNotFoundError:
     exit(1)
 
 # 2. Setup Environment Variables (Critical Step)
+selected_model = configure_runtime_env(config)
 if config['OPENAI_API_TYPE'] == 'ollama':
-    os.environ["OPENAI_API_TYPE"] = 'ollama'
-    os.environ["OLLAMA_API_BASE"] = config.get("OLLAMA_API_BASE", "http://localhost:11434/v1")
-    os.environ["OPENAI_BASE_URL"] = os.environ["OLLAMA_API_BASE"]
-    os.environ["OLLAMA_API_KEY"] = config.get("OLLAMA_API_KEY", "ollama")
-    os.environ["OLLAMA_CHAT_MODEL"] = config['OLLAMA_CHAT_MODEL']
-    os.environ["OLLAMA_EMBED_MODEL"] = config['OLLAMA_EMBED_MODEL']
-    print(f"[yellow]Configured for Local Ollama: {config['OLLAMA_CHAT_MODEL']}[/yellow]")
-
-elif config['OPENAI_API_TYPE'] == 'openai':
-    os.environ["OPENAI_API_TYPE"] = 'openai'
-    os.environ["OPENAI_API_KEY"] = config['OPENAI_KEY']
-    os.environ["OPENAI_CHAT_MODEL"] = config['OPENAI_CHAT_MODEL']
-
-elif config['OPENAI_API_TYPE'] == 'azure':
-    os.environ["OPENAI_API_TYPE"] = 'azure'
-    os.environ["AZURE_EMBED_DEPLOY_NAME"] = config['AZURE_EMBED_DEPLOY_NAME']
-    # Add other azure keys if needed
+    print(f"[yellow]Configured for Local Ollama: {selected_model}[/yellow]")
 
 # 3. Initialize and Check Memory
 try:

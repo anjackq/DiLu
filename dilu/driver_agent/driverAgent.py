@@ -15,6 +15,7 @@ from dilu.scenario.envScenario import EnvScenario
 
 delimiter = "####"
 ACTION_RECOVERY_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*(?:<[^>]+>\s*)?([0-4])\s*$", re.IGNORECASE | re.MULTILINE)
+ACTION_ANYWHERE_PATTERN = re.compile(r"\b([0-4])\b")
 # ... (Keep example_message and example_answer variables as they are in original) ...
 example_message = textwrap.dedent(f"""\
         {delimiter} Driving scenario description:
@@ -106,7 +107,12 @@ class DriverAgent:
 
         ### DRIVE LOGIC:
         1. SAFETY: If a lead car is closer than 25m and your speed is higher, you MUST decelerate (Action_id 4).
-        2. EFFICIENCY: Maintain a target speed of 28m/s. Change lanes (0 or 2) if blocked by slower traffic.
+        2. NO-UNNECESSARY-LANE-CHANGE: If the lead car in your current lane is not slower than you (or not close enough to block you), do not change lane just for preference.
+        3. EFFICIENCY: Maintain a target speed of 28m/s.
+        4. TRAFFIC RULE (RIGHT-HAND TRAFFIC): Prefer overtaking from the LEFT lane.
+           - If blocked by slower traffic in your lane, first consider Turn-left (Action_id 0) when safe.
+           - Do NOT choose Turn-right (Action_id 2) to overtake a slower vehicle in front unless there is a clear safety reason and left change is not feasible.
+           - If no safe lane change exists and risk is increasing, decelerate (Action_id 4).
 
         You MUST format your response EXACTLY like this, using these exact headings:
 
@@ -209,7 +215,27 @@ class DriverAgent:
                 ]
                 with get_openai_callback() as cb:
                     check_response = self.llm.invoke(messages)  # Changed from self.llm(messages)
-                result = int(check_response.content.split(delimiter)[-1])
+
+                check_text = (check_response.content or "").strip()
+                tail = check_text.split(delimiter)[-1].strip() if delimiter in check_text else check_text
+                try:
+                    result = int(tail)
+                    if result < 0 or result > 4:
+                        raise ValueError
+                except ValueError:
+                    matches = ACTION_RECOVERY_PATTERN.findall(check_text)
+                    if matches:
+                        result = int(matches[-1])
+                        print(f"[yellow]Recovered action from checker output:[/yellow] {result}")
+                    else:
+                        any_matches = ACTION_ANYWHERE_PATTERN.findall(check_text)
+                        if any_matches:
+                            result = int(any_matches[-1])
+                            print(f"[yellow]Recovered action from loose parse:[/yellow] {result}")
+                        else:
+                            # Safety-first fallback for driving.
+                            result = 4
+                            print("[red]Checker output parse failed. Falling back to safe action 4 (Deceleration).[/red]")
 
         few_shot_answers_store = ""
         for i in range(len(fewshot_messages)):
