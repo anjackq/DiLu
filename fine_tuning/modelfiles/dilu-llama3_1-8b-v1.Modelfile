@@ -1,4 +1,4 @@
-# Source: path to the merged model folder exported by train_dilu_updated.py
+# Source: path to the merged model folder exported by train_dilu_ollama.py
 FROM .
 
 TEMPLATE """{{ if .System }}<|start_header_id|>system<|end_header_id|>

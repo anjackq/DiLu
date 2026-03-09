@@ -35,7 +35,7 @@ def main():
         _run(
             [
                 args.python,
-                os.path.join(ROOT_DIR, "collect_data.py"),
+                os.path.join(ROOT_DIR, "fine_tuning/collect_data.py"),
                 "--episodes",
                 str(args.episodes),
                 "--output",
@@ -47,7 +47,7 @@ def main():
         _run(
             [
                 args.python,
-                os.path.join(ROOT_DIR, "data/convert_data.py"),
+                os.path.join(ROOT_DIR, "fine_tuning/convert_data.py"),
                 "--input",
                 args.raw_output,
                 "--output",
@@ -56,13 +56,13 @@ def main():
         )
 
     if args.validate or run_all:
-        _run([args.python, os.path.join(ROOT_DIR, "validate_finetune_dataset.py"), args.clean_output])
+        _run([args.python, os.path.join(ROOT_DIR, "fine_tuning/validate_finetune_dataset.py"), args.clean_output])
 
     if args.train or run_all:
         _run(
             [
                 args.python,
-                os.path.join(ROOT_DIR, "fine_tuning/train_dilu_updated.py"),
+                os.path.join(ROOT_DIR, "fine_tuning/train_dilu_ollama.py"),
                 "--data-file",
                 args.clean_output,
                 "--model-name",

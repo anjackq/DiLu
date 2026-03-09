@@ -162,33 +162,33 @@ results/
 Generate training data (rule-based expert labels from DiLu scenarios):
 
 ```bash
-python collect_data.py
+python fine_tuning/collect_data.py
 ```
 This writes `data/gold_standard_data.jsonl`.
 
 Convert data to the strict instruction/output format used by the training scripts:
 
 ```bash
-python data/convert_data.py
+python fine_tuning/convert_data.py
 ```
 
 Validate the cleaned dataset schema/format before training:
 
 ```bash
-python validate_finetune_dataset.py data/gold_standard_data_clean.jsonl
+python fine_tuning/validate_finetune_dataset.py data/gold_standard_data_clean.jsonl
 ```
 
 Train and export a merged model for Ollama (Unsloth + TRL):
 
 ```bash
-python fine_tuning/train_dilu_updated.py
+python fine_tuning/train_dilu_ollama.py
 ```
 
 Family-aware training examples:
 
 ```bash
-python fine_tuning/train_dilu_updated.py --model-name unsloth/Llama-3.1-8B-Instruct --model-family llama3
-python fine_tuning/train_dilu_updated.py --model-name unsloth/Qwen2.5-7B-Instruct --model-family qwen
+python fine_tuning/train_dilu_ollama.py --model-name unsloth/Llama-3.1-8B-Instruct --model-family llama3
+python fine_tuning/train_dilu_ollama.py --model-name unsloth/Qwen2.5-7B-Instruct --model-family qwen
 ```
 
 Run the full pipeline (collect -> convert -> validate -> train):
