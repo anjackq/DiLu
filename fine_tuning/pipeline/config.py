@@ -18,6 +18,16 @@ FAMILY_DEFAULTS: Dict[str, Dict[str, object]] = {
         "lora_targets": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         "max_seq_length": 4096,
     },
+    "deepseek": {
+        "chat_template": "chatml",
+        "lora_targets": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        "max_seq_length": 4096,
+    },
+    "phi": {
+        "chat_template": "chatml",
+        "lora_targets": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        "max_seq_length": 4096,
+    },
 }
 
 
@@ -42,6 +52,10 @@ def apply_windows_short_temp(short_temp: str = "C:\\ui") -> str:
 
 def infer_model_family(model_name: str) -> str:
     name = (model_name or "").lower()
+    if "phi" in name:
+        return "phi"
+    if "deepseek" in name:
+        return "deepseek"
     if "llama" in name:
         return "llama3"
     if "qwen" in name:

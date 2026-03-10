@@ -1,6 +1,5 @@
-# Source: merged model folder exported by train_dilu_ollama.py
-# If your path differs, update this line before `ollama create`.
-FROM ./fine_tuning/merged_models/dilu-llama3_1-8b-v1
+FROM phi4-mini:3.8b
+ADAPTER ../adapters/dilu-phi4-mini-3_8b-v1
 
 PARAMETER temperature 0.1
 PARAMETER num_ctx 4096
