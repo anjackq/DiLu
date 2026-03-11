@@ -150,7 +150,10 @@ including videos, episode DBs, `log.txt`, and `run_metrics_*.json`.
 Ollama think/no-think switch:
 - `OLLAMA_THINK_MODE: 'no_think'` can reduce long chain-of-thought latency on reasoning models.
 - `OLLAMA_THINK_MODE: 'think'` enables explicit reasoning mode when supported.
+- Qwen-family Ollama models such as `qwen3:8b` and `qwen3.5:0.8b` are treated as reasoning-capable for this native think/no-think switch.
+- If native Ollama rejects `think=true`, DiLu retries once without the `think` flag and continues in effective `auto` mode before falling back to `/v1`.
 - `OLLAMA_THINK_MODE: 'auto'` leaves model default behavior.
+- For non-reasoning models such as `llama3.2:3b`, prefer `auto` or `no_think`.
 - This switch is applied in the **driver agent** path in this phase; reflection behavior is unchanged.
 
 ### Gemini Runtime
@@ -248,10 +251,39 @@ If a model hangs or responds very slowly, run with timeout guardrails:
 python evaluate_models_ollama.py --models qwen3:0.6b --limit 1 --few-shot-num 0 --decision-timeout-sec 60 --disable-streaming --disable-checker-llm
 ```
 
+For mixed-model benchmarks, prefer per-model runtime overrides in `config.yaml` so small models do not inherit large-model timeout/think settings:
+
+```yaml
+eval_slow_decision_threshold_sec: 5.0
+eval_model_overrides:
+  'qwen3.5:0.8b':
+    ollama_think_mode: 'no_think'
+    decision_timeout_sec: 8
+    ollama_native_chat_timeout_sec: 8
+    decision_max_output_tokens: 96
+    disable_streaming: true
+    disable_checker_llm: true
+  'qwen3.5:2b':
+    ollama_think_mode: 'no_think'
+    decision_timeout_sec: 10
+    ollama_native_chat_timeout_sec: 10
+    decision_max_output_tokens: 128
+    disable_streaming: true
+    disable_checker_llm: true
+```
+
+In Ollama native mode, timeout handling is safety-first: native timeout does not retry through `/v1` for that decision, and the agent falls back to safe action `4`.
+
 Force no-think mode in evaluation (Ollama models):
 
 ```bash
 python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 0 --ollama-think-mode no_think --ollama-use-native-chat
+```
+
+Force think mode in evaluation (Qwen-family Ollama models):
+
+```bash
+python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 0 --ollama-think-mode think --ollama-use-native-chat
 ```
 
 Run a larger comparison:
@@ -268,6 +300,37 @@ python evaluate_models_ollama.py --models deepseek-r1:14b dilu-llama3_1-8b-v1 --
 python evaluate_models_ollama.py --models deepseek-r1:14b --limit 3 --output results/my_eval_report.json
 ```
 
+Merge latest per-model eval outputs inside one experiment (no cross-experiment merge):
+
+```bash
+python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --models llama3.2:1b qwen3.5:0.8b deepseek-r1:1.5b --results-root results
+```
+
+List available models in an experiment before merging:
+
+```bash
+python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --results-root results --list-models
+```
+
+This merge is strict and fail-fast:
+- same `few_shot_num`
+- same `simulation_duration`
+- same seed list
+- same core runtime metrics config keys (timeouts/streaming/checker/thresholds)
+
+Then visualize the merged report:
+
+```bash
+python plot_eval_compare.py -i results/tier1_lightweight_base_instruct/compare/eval_compare_<timestamp>.json --extended
+```
+
+Opt-in run artifacts during eval (videos, episode DBs, per-model run log, run metrics):
+
+```bash
+python evaluate_models_ollama.py --models deepseek-r1:14b --limit 1 --save-run-artifacts
+python evaluate_models_ollama.py --models deepseek-r1:14b --limit 1 --save-run-artifacts --eval-run-id eval_run_debug
+```
+
 Optional reasoning-alignment sample collection (for manual or later judge-model scoring):
 
 ```bash
@@ -281,17 +344,26 @@ By default this saves:
   - `.../models/<model_slug>/eval/eval_episodes_<timestamp>.json`
 - Experiment manifest: `results/experiments/<experiment_id>/manifest.json`
 
+If `--save-run-artifacts` is enabled, it also saves under each model:
+- `.../models/<model_slug>/runs/<eval_run_id>/log.txt`
+- `.../models/<model_slug>/runs/<eval_run_id>/highway_seed_<seed>.db`
+- `.../models/<model_slug>/runs/<eval_run_id>/highway_seed_<seed>-episode-*.mp4`
+- `.../models/<model_slug>/runs/<eval_run_id>/run_metrics_<timestamp>.json`
+
 The benchmark report includes:
 - Existing metrics: crash/no-collision rates, avg steps, runtime, response format rates
 - New online safety metrics: TTC danger rate (`TTC < 2.0s`), headway violation rate (`front gap < 15m`)
 - New efficiency/comfort metrics: reward summary, average ego speed, lane-change rate, accel/decel flapping rate (`3↔4`)
 - New system metrics: format failure rate and decision-latency estimate (`ms/step`)
 - Timeout reliability metrics: decision timeout rate, timeout episode rate, fallback action rate, timeout episode count
+- Ollama transport stability metrics: native timeout rate/episodes and native timeout short-circuit count
 
 Timeout Reliability Metrics:
 - `decision_timeout_rate_mean`: primary runtime reliability metric (`decision_timeouts_total / decision_calls_total`)
 - `timeout_episode_rate`: episodes with at least one timeout over total episodes
 - `fallback_action_rate_mean`: share of decisions that required safety fallback (`action 4` via timeout/parse fallback)
+- `ollama_native_timeout_rate_mean`: share of decisions that timed out in native Ollama path
+- `ollama_native_timeout_episode_rate`: share of episodes with at least one native Ollama timeout
 - Interpretation: lower timeout/fallback rates indicate a more stable inference pipeline
 
 Plot the comparison report:

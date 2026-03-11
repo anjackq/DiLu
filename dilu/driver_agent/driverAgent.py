@@ -66,6 +66,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _is_timeout_exception(exc: Exception) -> bool:
+    return isinstance(exc, (TimeoutError, requests.Timeout))
+
+
 def _normalize_ollama_think_mode(raw: str) -> str:
     mode = str(raw or "auto").strip().lower()
     if mode in {"think", "true", "on", "1"}:
@@ -90,6 +94,32 @@ def _ollama_native_chat_url(api_base: str) -> str:
     if not root_path.endswith("/"):
         root_path += "/"
     return f"{parsed.scheme}://{parsed.netloc}{root_path}api/chat"
+
+
+def _ollama_model_maybe_supports_think(model_name: str) -> bool:
+    name = str(model_name or "").strip().lower()
+    if not name:
+        return False
+    # Allow obvious reasoning-oriented models to try native think mode.
+    reasoning_markers = (
+        "deepseek-r1",
+        "qwen",
+        "qwen2",
+        "qwen2.5",
+        "qwen3",
+        "qwen3.5",
+        "reason",
+        "reasoning",
+        "qwq",
+        "think",
+    )
+    if any(marker in name for marker in reasoning_markers):
+        return True
+    # Conservative default for general instruct/base families.
+    non_reasoning_prefixes = ("llama", "llama3", "llama3.1", "llama3.2", "mistral", "gemma")
+    if any(name.startswith(prefix) for prefix in non_reasoning_prefixes):
+        return False
+    return False
 
 
 def _ollama_role_from_message(msg) -> str:
@@ -147,6 +177,15 @@ class DriverAgent:
         self.ollama_chat_url = _ollama_native_chat_url(os.getenv("OLLAMA_API_BASE", "http://localhost:11434/v1"))
         self.ollama_model_name = os.getenv("OLLAMA_CHAT_MODEL")
         self.ollama_api_key = os.getenv("OLLAMA_API_KEY", "ollama")
+        self.ollama_native_think_supported = None
+        self.ollama_native_timed_out = False
+        self.ollama_model_think_heuristic = _ollama_model_maybe_supports_think(self.ollama_model_name)
+        self.ollama_think_downgrade_noted = False
+        self.last_ollama_transport = "provider_default"
+        self.last_ollama_effective_think_mode = self.ollama_think_mode
+        self.last_ollama_native_retry_used = False
+        self.last_ollama_native_timeout = False
+        self.last_ollama_native_timeout_short_circuit = False
         self.last_decision_meta = {
             "timed_out": False,
             "used_fallback": False,
@@ -155,6 +194,12 @@ class DriverAgent:
             "checker_used": False,
             "selected_action": None,
             "decision_elapsed_sec": 0.0,
+            "ollama_transport": None,
+            "ollama_requested_think_mode": None,
+            "ollama_effective_think_mode": None,
+            "ollama_native_retry_used": False,
+            "ollama_native_timeout": False,
+            "ollama_native_timeout_short_circuit": False,
         }
         if self.oai_api_type == "azure":
             print("Using Azure Chat API")
@@ -191,8 +236,9 @@ class DriverAgent:
 
             print(f"Using Local Ollama API: {model_name} at {api_base}")
             if self.ollama_use_native_chat:
+                effective_mode = self._get_ollama_effective_think_mode()
                 print(
-                    f"[yellow]DriverAgent Ollama mode: native /api/chat | think_mode={self.ollama_think_mode}[/yellow]"
+                    f"[yellow]DriverAgent Ollama mode: native /api/chat | think_mode={self.ollama_think_mode} | effective={effective_mode}[/yellow]"
                 )
 
             # Keep OpenAI-compatible client as fallback for native failures.
@@ -272,37 +318,158 @@ class DriverAgent:
             )
         return payload_messages
 
-    def _apply_ollama_think_mode(self, payload: dict) -> dict:
+    def _get_ollama_effective_think_mode(self) -> str:
         mode = self.ollama_think_mode
+        if mode != "think":
+            return mode
+        if self.ollama_native_think_supported is False:
+            return "auto"
+        if self.ollama_native_think_supported is True:
+            return "think"
+        if not self.ollama_model_think_heuristic:
+            self.ollama_native_think_supported = False
+            if not self.ollama_think_downgrade_noted:
+                print(
+                    f"[yellow]Native Ollama think flag is likely unsupported for {self.ollama_model_name}. "
+                    "Using effective think_mode=auto.[/yellow]"
+                )
+                self.ollama_think_downgrade_noted = True
+            return "auto"
+        return "think"
+
+    def _apply_ollama_think_mode(self, payload: dict, mode: str | None = None) -> dict:
+        mode = _normalize_ollama_think_mode(mode or self._get_ollama_effective_think_mode())
         if mode == "think":
             payload["think"] = True
         elif mode == "no_think":
             payload["think"] = False
         return payload
 
-    def _ollama_native_invoke(self, messages):
-        def _do_request(msgs):
-            payload = {
-                "model": self.ollama_model_name,
-                "messages": self._to_ollama_messages(msgs),
-                "stream": False,
-            }
-            payload = self._apply_ollama_think_mode(payload)
-            headers = {"Authorization": f"Bearer {self.ollama_api_key}"}
-            response = requests.post(
-                self.ollama_chat_url,
-                json=payload,
-                headers=headers,
-                timeout=self.ollama_native_chat_timeout_sec,
-            )
-            response.raise_for_status()
-            data = response.json()
-            msg = data.get("message", {}) or {}
-            return _content_to_text(msg.get("content", "")), _content_to_text(msg.get("thinking", ""))
+    def _ollama_request_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.ollama_api_key}"}
 
+    def _ollama_native_invoke_once(self, messages, think_mode: str):
+        payload = {
+            "model": self.ollama_model_name,
+            "messages": self._to_ollama_messages(messages),
+            "stream": False,
+        }
+        payload = self._apply_ollama_think_mode(payload, mode=think_mode)
+        response = requests.post(
+            self.ollama_chat_url,
+            json=payload,
+            headers=self._ollama_request_headers(),
+            timeout=self.ollama_native_chat_timeout_sec,
+        )
+        response.raise_for_status()
+        data = response.json()
+        msg = data.get("message", {}) or {}
+        return _content_to_text(msg.get("content", "")), _content_to_text(msg.get("thinking", ""))
+
+    def _ollama_native_stream_once(self, messages, think_mode: str):
+        payload = {
+            "model": self.ollama_model_name,
+            "messages": self._to_ollama_messages(messages),
+            "stream": True,
+        }
+        payload = self._apply_ollama_think_mode(payload, mode=think_mode)
+        content_chunks = []
+        thinking_chunks = []
+        with requests.post(
+            self.ollama_chat_url,
+            json=payload,
+            headers=self._ollama_request_headers(),
+            timeout=self.ollama_native_chat_timeout_sec,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                try:
+                    line = raw_line.decode("utf-8")
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                msg = data.get("message", {}) or {}
+                chunk_text = _content_to_text(msg.get("content", ""))
+                chunk_thinking = _content_to_text(msg.get("thinking", ""))
+                if chunk_text:
+                    content_chunks.append(chunk_text)
+                    print(chunk_text, end="", flush=True)
+                if chunk_thinking:
+                    thinking_chunks.append(chunk_thinking)
+                if data.get("done"):
+                    break
+        return "".join(content_chunks), "".join(thinking_chunks)
+
+    def _ollama_native_invoke(self, messages):
+        requested_mode = self.ollama_think_mode
+        effective_mode = self._get_ollama_effective_think_mode()
+        if self.ollama_native_timed_out:
+            self.last_ollama_transport = "native_timeout_short_circuit"
+            self.last_ollama_effective_think_mode = effective_mode
+            self.last_ollama_native_retry_used = False
+            self.last_ollama_native_timeout = True
+            self.last_ollama_native_timeout_short_circuit = True
+            raise TimeoutError(
+                f"Native Ollama timeout short-circuit active for {self.ollama_model_name}"
+            )
+        self.last_ollama_transport = "native"
+        self.last_ollama_effective_think_mode = effective_mode
+        self.last_ollama_native_retry_used = False
+        self.last_ollama_native_timeout = False
+        self.last_ollama_native_timeout_short_circuit = False
         try:
-            return self._run_with_timeout(_do_request, messages)
+            result = self._run_with_timeout(self._ollama_native_invoke_once, messages, effective_mode)
+            if effective_mode == "think":
+                self.ollama_native_think_supported = True
+            return result
         except Exception as exc:
+            if _is_timeout_exception(exc):
+                self.ollama_native_timed_out = True
+                self.last_ollama_transport = "native_timeout"
+                self.last_ollama_native_timeout = True
+                print(
+                    f"[yellow]Native Ollama chat timed out for {self.ollama_model_name}. "
+                    "Skipping /v1 retry and using timeout safety fallback.[/yellow]"
+                )
+                raise TimeoutError(str(exc))
+            if requested_mode == "think" and effective_mode == "think" and isinstance(exc, requests.HTTPError):
+                self.ollama_native_think_supported = False
+                self.last_ollama_native_retry_used = True
+                self.last_ollama_effective_think_mode = "auto"
+                print(
+                    f"[yellow]Native Ollama rejected think=true for {self.ollama_model_name}. "
+                    "Retrying without think flag.[/yellow]"
+                )
+                try:
+                    result = self._run_with_timeout(self._ollama_native_invoke_once, messages, "auto")
+                    if not self.ollama_think_downgrade_noted:
+                        print(
+                            f"[yellow]Native Ollama continuing with effective think_mode=auto for "
+                            f"{self.ollama_model_name}.[/yellow]"
+                        )
+                        self.ollama_think_downgrade_noted = True
+                    return result
+                except Exception as retry_exc:
+                    if _is_timeout_exception(retry_exc):
+                        self.ollama_native_timed_out = True
+                        self.last_ollama_transport = "native_timeout"
+                        self.last_ollama_native_timeout = True
+                        print(
+                            f"[yellow]Native Ollama retry without think timed out for {self.ollama_model_name}. "
+                            "Skipping /v1 retry and using timeout safety fallback.[/yellow]"
+                        )
+                        raise TimeoutError(str(retry_exc))
+                    self.last_ollama_transport = "openai_compat_fallback"
+                    print(
+                        f"[yellow]Native Ollama retry without think failed ({type(retry_exc).__name__}). "
+                        "Falling back to OpenAI-compatible path.[/yellow]"
+                    )
+                    response = self._run_with_timeout(self.llm.invoke, messages)
+                    return _content_to_text(getattr(response, "content", "")), ""
+            self.last_ollama_transport = "openai_compat_fallback"
             print(
                 f"[yellow]Native Ollama chat failed ({type(exc).__name__}). Falling back to OpenAI-compatible path.[/yellow]"
             )
@@ -310,47 +477,81 @@ class DriverAgent:
             return _content_to_text(getattr(response, "content", "")), ""
 
     def _ollama_native_stream(self, messages):
-        def _do_stream(msgs):
-            payload = {
-                "model": self.ollama_model_name,
-                "messages": self._to_ollama_messages(msgs),
-                "stream": True,
-            }
-            payload = self._apply_ollama_think_mode(payload)
-            headers = {"Authorization": f"Bearer {self.ollama_api_key}"}
-            content_chunks = []
-            thinking_chunks = []
-            with requests.post(
-                self.ollama_chat_url,
-                json=payload,
-                headers=headers,
-                timeout=self.ollama_native_chat_timeout_sec,
-                stream=True,
-            ) as response:
-                response.raise_for_status()
-                for raw_line in response.iter_lines():
-                    if not raw_line:
-                        continue
-                    try:
-                        line = raw_line.decode("utf-8")
-                        data = json.loads(line)
-                    except Exception:
-                        continue
-                    msg = data.get("message", {}) or {}
-                    chunk_text = _content_to_text(msg.get("content", ""))
-                    chunk_thinking = _content_to_text(msg.get("thinking", ""))
-                    if chunk_text:
-                        content_chunks.append(chunk_text)
-                        print(chunk_text, end="", flush=True)
-                    if chunk_thinking:
-                        thinking_chunks.append(chunk_thinking)
-                    if data.get("done"):
-                        break
-            return "".join(content_chunks), "".join(thinking_chunks)
-
+        requested_mode = self.ollama_think_mode
+        effective_mode = self._get_ollama_effective_think_mode()
+        if self.ollama_native_timed_out:
+            self.last_ollama_transport = "native_timeout_short_circuit"
+            self.last_ollama_effective_think_mode = effective_mode
+            self.last_ollama_native_retry_used = False
+            self.last_ollama_native_timeout = True
+            self.last_ollama_native_timeout_short_circuit = True
+            raise TimeoutError(
+                f"Native Ollama timeout short-circuit active for {self.ollama_model_name}"
+            )
+        self.last_ollama_transport = "native"
+        self.last_ollama_effective_think_mode = effective_mode
+        self.last_ollama_native_retry_used = False
+        self.last_ollama_native_timeout = False
+        self.last_ollama_native_timeout_short_circuit = False
         try:
-            return self._run_with_timeout(_do_stream, messages)
+            result = self._run_with_timeout(self._ollama_native_stream_once, messages, effective_mode)
+            if effective_mode == "think":
+                self.ollama_native_think_supported = True
+            return result
         except Exception as exc:
+            if _is_timeout_exception(exc):
+                self.ollama_native_timed_out = True
+                self.last_ollama_transport = "native_timeout"
+                self.last_ollama_native_timeout = True
+                print(
+                    f"[yellow]Native Ollama stream timed out for {self.ollama_model_name}. "
+                    "Skipping /v1 retry and using timeout safety fallback.[/yellow]"
+                )
+                raise TimeoutError(str(exc))
+            if requested_mode == "think" and effective_mode == "think" and isinstance(exc, requests.HTTPError):
+                self.ollama_native_think_supported = False
+                self.last_ollama_native_retry_used = True
+                self.last_ollama_effective_think_mode = "auto"
+                print(
+                    f"[yellow]Native Ollama rejected think=true for {self.ollama_model_name}. "
+                    "Retrying without think flag.[/yellow]"
+                )
+                try:
+                    result = self._run_with_timeout(self._ollama_native_stream_once, messages, "auto")
+                    if not self.ollama_think_downgrade_noted:
+                        print(
+                            f"[yellow]Native Ollama continuing with effective think_mode=auto for "
+                            f"{self.ollama_model_name}.[/yellow]"
+                        )
+                        self.ollama_think_downgrade_noted = True
+                    return result
+                except Exception as retry_exc:
+                    if _is_timeout_exception(retry_exc):
+                        self.ollama_native_timed_out = True
+                        self.last_ollama_transport = "native_timeout"
+                        self.last_ollama_native_timeout = True
+                        print(
+                            f"[yellow]Native Ollama stream retry without think timed out for {self.ollama_model_name}. "
+                            "Skipping /v1 retry and using timeout safety fallback.[/yellow]"
+                        )
+                        raise TimeoutError(str(retry_exc))
+                    self.last_ollama_transport = "openai_compat_fallback"
+                    print(
+                        f"[yellow]Native Ollama retry without think failed ({type(retry_exc).__name__}). "
+                        "Falling back to OpenAI-compatible stream.[/yellow]"
+                    )
+
+                    def _collect_stream(msgs):
+                        chunks = []
+                        for chunk in self.llm.stream(msgs):
+                            chunk_text = _content_to_text(getattr(chunk, "content", ""))
+                            if chunk_text:
+                                chunks.append(chunk_text)
+                                print(chunk_text, end="", flush=True)
+                        return "".join(chunks)
+
+                    return self._run_with_timeout(_collect_stream, messages), ""
+            self.last_ollama_transport = "openai_compat_fallback"
             print(
                 f"[yellow]Native Ollama stream failed ({type(exc).__name__}). Falling back to OpenAI-compatible stream.[/yellow]"
             )
@@ -442,6 +643,12 @@ class DriverAgent:
             "checker_used": False,
             "selected_action": None,
             "decision_elapsed_sec": 0.0,
+            "ollama_transport": None,
+            "ollama_requested_think_mode": self.ollama_think_mode if self.oai_api_type == "ollama" else None,
+            "ollama_effective_think_mode": None,
+            "ollama_native_retry_used": False,
+            "ollama_native_timeout": False,
+            "ollama_native_timeout_short_circuit": False,
         }
 
         # NOTE: get_openai_callback might return 0 for Ollama
@@ -466,6 +673,12 @@ class DriverAgent:
             decision_meta["parse_mode"] = "timeout_fallback"
             decision_meta["selected_action"] = 4
             decision_meta["decision_elapsed_sec"] = round(time.time() - start_time, 3)
+            if self.oai_api_type == "ollama":
+                decision_meta["ollama_transport"] = self.last_ollama_transport
+                decision_meta["ollama_effective_think_mode"] = self.last_ollama_effective_think_mode
+                decision_meta["ollama_native_retry_used"] = bool(self.last_ollama_native_retry_used)
+                decision_meta["ollama_native_timeout"] = bool(self.last_ollama_native_timeout)
+                decision_meta["ollama_native_timeout_short_circuit"] = bool(self.last_ollama_native_timeout_short_circuit)
             self.last_decision_meta = decision_meta
             few_shot_answers_store = ""
             for i in range(len(fewshot_messages)):
@@ -564,6 +777,12 @@ class DriverAgent:
                                       "\n---------------\n"
         decision_meta["selected_action"] = int(result)
         decision_meta["decision_elapsed_sec"] = round(time.time() - start_time, 3)
+        if self.oai_api_type == "ollama":
+            decision_meta["ollama_transport"] = self.last_ollama_transport
+            decision_meta["ollama_effective_think_mode"] = self.last_ollama_effective_think_mode
+            decision_meta["ollama_native_retry_used"] = bool(self.last_ollama_native_retry_used)
+            decision_meta["ollama_native_timeout"] = bool(self.last_ollama_native_timeout)
+            decision_meta["ollama_native_timeout_short_circuit"] = bool(self.last_ollama_native_timeout_short_circuit)
         self.last_decision_meta = decision_meta
         print("Result:", result)
         return result, response_content, human_message, few_shot_answers_store

@@ -53,6 +53,7 @@ def _plot_grid(models, charts, title: str, output_path: str) -> None:
         values = chart["values"]
         bars = ax.bar(models, values, color=chart["color"], alpha=0.9)
         ax.set_title(chart["title"])
+        ax.set_xticks(range(len(models)))
         ax.set_xticklabels(models, rotation=20, ha="right")
         if chart["ylim"] is not None:
             ax.set_ylim(*chart["ylim"])
@@ -101,6 +102,10 @@ def plot_aggregates(report: dict, output_path: str, extended: bool = False, all_
             {"values": [_safe_value(row.get("timeout_episode_rate")) for row in aggregates], "title": "Timeout Episode Rate", "ylim": (0, 1), "color": "#a6761d"},
             {"values": [_safe_value(row.get("fallback_action_rate_mean")) for row in aggregates], "title": "Fallback Action Rate", "ylim": (0, 1), "color": "#666666"},
             {"values": [_safe_value(row.get("timeout_episode_count")) for row in aggregates], "title": "Timeout Episodes (count)", "ylim": None, "color": "#1f78b4"},
+            {"values": [_safe_value(row.get("ollama_native_retry_rate_mean")) for row in aggregates], "title": "Ollama Native Retry Rate", "ylim": (0, 1), "color": "#8c510a"},
+            {"values": [_safe_value(row.get("ollama_openai_fallback_rate_mean")) for row in aggregates], "title": "Ollama /v1 Fallback Rate", "ylim": (0, 1), "color": "#01665e"},
+            {"values": [_safe_value(row.get("ollama_native_decision_rate_mean")) for row in aggregates], "title": "Ollama Native Decision Rate", "ylim": (0, 1), "color": "#5e3c99"},
+            {"values": [_safe_value(row.get("ollama_downgrade_episode_rate")) for row in aggregates], "title": "Ollama Downgrade Episode Rate", "ylim": (0, 1), "color": "#b2182b"},
         ]
         _plot_grid(models, charts, f"{title_prefix} (All Metrics)", output_path)
         return
@@ -117,8 +122,8 @@ def plot_aggregates(report: dict, output_path: str, extended: bool = False, all_
 
     charts = [
         {"values": [_safe_value(row.get("decision_timeout_rate_mean")) for row in aggregates], "title": "Decision Timeout Rate", "ylim": (0, 1), "color": "#e7298a"},
-        {"values": [_safe_value(row.get("timeout_episode_rate")) for row in aggregates], "title": "Timeout Episode Rate", "ylim": (0, 1), "color": "#a6761d"},
-        {"values": [_safe_value(row.get("fallback_action_rate_mean")) for row in aggregates], "title": "Fallback Action Rate", "ylim": (0, 1), "color": "#666666"},
+        {"values": [_safe_value(row.get("ollama_openai_fallback_rate_mean")) for row in aggregates], "title": "Ollama /v1 Fallback Rate", "ylim": (0, 1), "color": "#01665e"},
+        {"values": [_safe_value(row.get("ollama_downgrade_episode_rate")) for row in aggregates], "title": "Ollama Downgrade Episode Rate", "ylim": (0, 1), "color": "#b2182b"},
         {"values": [_safe_value(row.get("ttc_danger_rate_mean")) for row in aggregates], "title": "TTC Danger Rate", "ylim": (0, 1), "color": "#e41a1c"},
     ]
     _plot_grid(models, charts, f"{title_prefix} (Extended Runtime/Safety)", output_path)

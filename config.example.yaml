@@ -66,3 +66,25 @@ eval_decision_timeout_sec: 60
 eval_decision_max_output_tokens: 512
 eval_disable_streaming: true
 eval_disable_checker_llm: true
+eval_slow_decision_threshold_sec: 5.0
+eval_save_run_artifacts: false
+eval_run_id: null # null -> auto eval_run_<timestamp> when artifact capture is enabled
+
+# Optional per-model runtime overrides for evaluate_models_ollama.py.
+# Precedence: CLI flags (if provided) > per-model override > global eval defaults above.
+# Matching: exact model name first, then wildcard/prefix entries.
+eval_model_overrides:
+  'qwen3.5:0.8b':
+    ollama_think_mode: 'no_think'
+    decision_timeout_sec: 8
+    ollama_native_chat_timeout_sec: 8
+    decision_max_output_tokens: 96
+    disable_streaming: true
+    disable_checker_llm: true
+  'qwen3.5:2b':
+    ollama_think_mode: 'no_think'
+    decision_timeout_sec: 10
+    ollama_native_chat_timeout_sec: 10
+    decision_max_output_tokens: 128
+    disable_streaming: true
+    disable_checker_llm: true
