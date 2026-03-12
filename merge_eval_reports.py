@@ -130,27 +130,25 @@ def _discover_model_artifacts(experiment_root: str, model_name: str) -> Optional
 def _discover_available_models(experiment_root: str) -> List[Dict]:
     manifest_path = os.path.join(experiment_root, "manifest.json")
     manifest = read_json(manifest_path, default={})
-    rows: List[Dict] = []
-    seen = set()
+    rows_by_key: Dict[str, Dict] = {}
 
     models = manifest.get("models", {})
     if isinstance(models, dict):
         for model_name, entry in models.items():
             if not isinstance(entry, dict):
                 continue
+            model_str = str(model_name)
+            key = model_str.strip().lower()
             slug = entry.get("slug") or slugify_model_name(str(model_name))
             summary_path = _resolve_existing_path(entry.get("latest_eval_summary"), experiment_root)
             episodes_path = _resolve_existing_path(entry.get("latest_eval_episodes"), experiment_root)
-            rows.append(
-                {
-                    "model": str(model_name),
-                    "slug": slug,
-                    "source_kind": "manifest",
-                    "summary_path": summary_path,
-                    "episodes_path": episodes_path,
-                }
-            )
-            seen.add(str(model_name).strip().lower())
+            rows_by_key[key] = {
+                "model": model_str,
+                "slug": slug,
+                "source_kind": "manifest",
+                "summary_path": summary_path,
+                "episodes_path": episodes_path,
+            }
 
     model_root = os.path.join(experiment_root, "models")
     if os.path.isdir(model_root):
@@ -170,21 +168,52 @@ def _discover_available_models(experiment_root: str) -> List[Dict]:
             except Exception:
                 pass
             key = inferred_name.strip().lower()
-            if key in seen:
+            candidate = {
+                "model": inferred_name,
+                "slug": slug,
+                "source_kind": "filesystem_latest",
+                "summary_path": os.path.abspath(newest_summary),
+                "episodes_path": os.path.abspath(newest_episodes) if newest_episodes else None,
+            }
+            existing = rows_by_key.get(key)
+            if existing is None:
+                rows_by_key[key] = candidate
                 continue
-            rows.append(
-                {
-                    "model": inferred_name,
-                    "slug": slug,
-                    "source_kind": "filesystem_latest",
-                    "summary_path": os.path.abspath(newest_summary),
-                    "episodes_path": os.path.abspath(newest_episodes) if newest_episodes else None,
-                }
-            )
-            seen.add(key)
+            # Prefer filesystem fallback if manifest entry exists but has no valid summary.
+            if not existing.get("summary_path"):
+                rows_by_key[key] = candidate
 
+    rows = list(rows_by_key.values())
     rows.sort(key=lambda r: str(r.get("model", "")))
     return rows
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in items:
+        name = str(raw).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _discover_available_model_names(experiment_root: str) -> List[str]:
+    rows = _discover_available_models(experiment_root)
+    discovered: List[str] = []
+    for row in rows:
+        model_name = str(row.get("model", "")).strip()
+        if not model_name:
+            continue
+        # Ensure the model still resolves through the main artifact discovery path.
+        if _discover_model_artifacts(experiment_root, model_name):
+            discovered.append(model_name)
+    return _dedupe_preserve_order(discovered)
 
 
 def _read_episodes(summary_payload: Dict, episodes_path: Optional[str]) -> List[Dict]:
@@ -266,7 +295,17 @@ def main() -> None:
         description="Merge latest per-model eval outputs inside a single experiment id."
     )
     parser.add_argument("--experiment-id", required=True, help="Experiment id under --results-root.")
-    parser.add_argument("--models", nargs="+", default=None, help="Model names to merge.")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help="Model names to merge. If omitted, all available models with latest eval artifacts are merged.",
+    )
+    parser.add_argument(
+        "--include-available",
+        action="store_true",
+        help="When used with --models, merge the union of explicit models and all available models.",
+    )
     parser.add_argument(
         "--list-models",
         action="store_true",
@@ -304,8 +343,19 @@ def main() -> None:
             )
         return
 
-    if not args.models:
-        raise ValueError("`--models` is required unless `--list-models` is used.")
+    available_models = _discover_available_model_names(experiment_root)
+    if args.models and args.include_available:
+        selected_models = _dedupe_preserve_order(list(args.models) + available_models)
+    elif args.models:
+        selected_models = _dedupe_preserve_order(list(args.models))
+    else:
+        selected_models = available_models
+
+    if not selected_models:
+        raise ValueError(
+            "No mergeable model eval summaries found in this experiment. "
+            "Run evaluations first or pass explicit --models."
+        )
 
     per_model_payloads: Dict[str, Dict] = {}
     model_sources: Dict[str, Dict] = {}
@@ -314,7 +364,7 @@ def main() -> None:
     baseline_model = None
     baseline_profile = None
 
-    for model_name in args.models:
+    for model_name in selected_models:
         source = _discover_model_artifacts(experiment_root, model_name)
         if not source:
             raise FileNotFoundError(
@@ -358,9 +408,9 @@ def main() -> None:
     os.makedirs(compare_dir, exist_ok=True)
     out_path = args.output or timestamped_results_path("eval_compare", ext=".json", results_dir=compare_dir)
 
-    ordered_aggregates = [per_model_payloads[m]["aggregate"] for m in args.models]
-    ordered_per_model = {m: per_model_payloads[m]["episodes"] for m in args.models}
-    baseline_metrics = copy.deepcopy(per_model_payloads[args.models[0]]["metrics_config"])
+    ordered_aggregates = [per_model_payloads[m]["aggregate"] for m in selected_models]
+    ordered_per_model = {m: per_model_payloads[m]["episodes"] for m in selected_models}
+    baseline_metrics = copy.deepcopy(per_model_payloads[selected_models[0]]["metrics_config"])
     report = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "report_schema_version": "2.0",
@@ -369,7 +419,7 @@ def main() -> None:
         "experiment_id": args.experiment_id,
         "experiment_root": experiment_root,
         "compare_dir": compare_dir,
-        "models": list(args.models),
+        "models": list(selected_models),
         "seeds": baseline_profile["seeds"],
         "few_shot_num": baseline_profile["few_shot_num"],
         "simulation_duration": baseline_profile["simulation_duration"],
@@ -387,7 +437,7 @@ def main() -> None:
     _update_manifest_for_merged_report(experiment_root, args.experiment_id, out_path)
 
     print(f"[green]Merged compare report:[/green] {out_path}")
-    for model_name in args.models:
+    for model_name in selected_models:
         src = model_sources[model_name]
         print(f"- {model_name}: {src['source_kind']} | {os.path.basename(src['summary_path'])}")
 

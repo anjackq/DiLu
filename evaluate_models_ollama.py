@@ -138,13 +138,28 @@ def _response_format_metrics(response_content: str) -> Dict:
     }
 
 
-def extract_step_traffic_metrics(env, ttc_threshold_sec: float, headway_threshold_m: float) -> Dict:
+def extract_step_traffic_metrics(
+    env,
+    ttc_threshold_sec: float,
+    headway_threshold_m: float,
+    rear_ttc_threshold_sec: float,
+    rear_headway_threshold_m: float,
+    low_speed_blocking_threshold_mps: float,
+    blocking_front_gap_safe_m: float,
+    blocking_front_ttc_safe_sec: float,
+) -> Dict:
     ego_speed_mps = None
     front_gap_m = None
     relative_speed_mps = None
     ttc_sec = None
     ttc_danger = False
     headway_violation = False
+    rear_gap_m = None
+    rear_closing_speed_mps = None
+    rear_ttc_sec = None
+    rear_ttc_danger = False
+    rear_headway_violation = False
+    low_speed_blocking = False
 
     try:
         uenv = env.unwrapped
@@ -153,7 +168,7 @@ def extract_step_traffic_metrics(env, ttc_threshold_sec: float, headway_threshol
         if ego is not None:
             ego_speed_mps = float(getattr(ego, "speed", 0.0))
         if ego is not None and road is not None:
-            front_vehicle, _ = road.neighbour_vehicles(ego, ego.lane_index)
+            front_vehicle, rear_vehicle = road.neighbour_vehicles(ego, ego.lane_index)
             if front_vehicle is not None:
                 front_gap_m = float(np.linalg.norm(ego.position - front_vehicle.position))
                 relative_speed_mps = float(ego.speed - front_vehicle.speed)
@@ -161,6 +176,22 @@ def extract_step_traffic_metrics(env, ttc_threshold_sec: float, headway_threshol
                     ttc_sec = front_gap_m / max(relative_speed_mps, 1e-6)
                     ttc_danger = bool(ttc_sec < ttc_threshold_sec)
                 headway_violation = bool(front_gap_m < headway_threshold_m)
+            if rear_vehicle is not None:
+                rear_gap_m = float(np.linalg.norm(ego.position - rear_vehicle.position))
+                rear_closing_speed_mps = float(rear_vehicle.speed - ego.speed)
+                if rear_closing_speed_mps > 0:
+                    rear_ttc_sec = rear_gap_m / max(rear_closing_speed_mps, 1e-6)
+                    rear_ttc_danger = bool(rear_ttc_sec < rear_ttc_threshold_sec)
+                rear_headway_violation = bool(rear_gap_m < rear_headway_threshold_m)
+
+            front_gap_safe = bool(front_gap_m is None or front_gap_m >= blocking_front_gap_safe_m)
+            front_ttc_safe = bool(ttc_sec is None or ttc_sec >= blocking_front_ttc_safe_sec)
+            low_speed_blocking = bool(
+                ego_speed_mps is not None
+                and ego_speed_mps < low_speed_blocking_threshold_mps
+                and front_gap_safe
+                and front_ttc_safe
+            )
     except Exception:
         pass
 
@@ -171,6 +202,12 @@ def extract_step_traffic_metrics(env, ttc_threshold_sec: float, headway_threshol
         "ttc_sec": ttc_sec,
         "ttc_danger": ttc_danger,
         "headway_violation": headway_violation,
+        "rear_gap_m": rear_gap_m,
+        "rear_closing_speed_mps": rear_closing_speed_mps,
+        "rear_ttc_sec": rear_ttc_sec,
+        "rear_ttc_danger": rear_ttc_danger,
+        "rear_headway_violation": rear_headway_violation,
+        "low_speed_blocking": low_speed_blocking,
     }
 
 
@@ -183,6 +220,11 @@ def run_episode(
     temp_dir: str,
     ttc_threshold_sec: float,
     headway_threshold_m: float,
+    rear_ttc_threshold_sec: float,
+    rear_headway_threshold_m: float,
+    low_speed_blocking_threshold_mps: float,
+    blocking_front_gap_safe_m: float,
+    blocking_front_ttc_safe_sec: float,
     alignment_sample_rate: float,
     alignment_max_samples: int,
     slow_decision_threshold_sec: float,
@@ -230,6 +272,9 @@ def run_episode(
     ego_speed_count = 0
     ttc_danger_steps = 0
     headway_violation_steps = 0
+    rear_ttc_danger_steps = 0
+    rear_headway_violation_steps = 0
+    low_speed_blocking_steps = 0
     lane_change_count = 0
     flap_accel_decel_count = 0
     prev_action_id = None
@@ -335,12 +380,24 @@ def run_episode(
             steps += 1
             episode_reward_sum += float(reward)
 
-            step_metrics = extract_step_traffic_metrics(env, ttc_threshold_sec, headway_threshold_m)
+            step_metrics = extract_step_traffic_metrics(
+                env,
+                ttc_threshold_sec,
+                headway_threshold_m,
+                rear_ttc_threshold_sec,
+                rear_headway_threshold_m,
+                low_speed_blocking_threshold_mps,
+                blocking_front_gap_safe_m,
+                blocking_front_ttc_safe_sec,
+            )
             if step_metrics["ego_speed_mps"] is not None:
                 ego_speed_sum += float(step_metrics["ego_speed_mps"])
                 ego_speed_count += 1
             ttc_danger_steps += int(step_metrics["ttc_danger"])
             headway_violation_steps += int(step_metrics["headway_violation"])
+            rear_ttc_danger_steps += int(step_metrics["rear_ttc_danger"])
+            rear_headway_violation_steps += int(step_metrics["rear_headway_violation"])
+            low_speed_blocking_steps += int(step_metrics["low_speed_blocking"])
 
             # Keep DB prompt logs for replay/debugging if needed.
             try:
@@ -371,6 +428,9 @@ def run_episode(
     avg_ego_speed_mps = ego_speed_sum / max(ego_speed_count, 1)
     ttc_danger_rate = ttc_danger_steps / max(steps, 1)
     headway_violation_rate = headway_violation_steps / max(steps, 1)
+    rear_ttc_danger_rate = rear_ttc_danger_steps / max(steps, 1)
+    rear_headway_violation_rate = rear_headway_violation_steps / max(steps, 1)
+    low_speed_blocking_rate = low_speed_blocking_steps / max(steps, 1)
     lane_change_rate = lane_change_count / max(steps, 1)
     flap_accel_decel_rate = flap_accel_decel_count / max(steps, 1)
     decision_latency_ms_avg = (duration_sec / max(steps, 1)) * 1000.0
@@ -435,6 +495,12 @@ def run_episode(
         "ttc_danger_rate": round(ttc_danger_rate, 4),
         "headway_violation_steps": headway_violation_steps,
         "headway_violation_rate": round(headway_violation_rate, 4),
+        "rear_ttc_danger_steps": rear_ttc_danger_steps,
+        "rear_ttc_danger_rate": round(rear_ttc_danger_rate, 4),
+        "rear_headway_violation_steps": rear_headway_violation_steps,
+        "rear_headway_violation_rate": round(rear_headway_violation_rate, 4),
+        "low_speed_blocking_steps": low_speed_blocking_steps,
+        "low_speed_blocking_rate": round(low_speed_blocking_rate, 4),
         "lane_change_count": lane_change_count,
         "lane_change_rate": round(lane_change_rate, 4),
         "flap_accel_decel_count": flap_accel_decel_count,
@@ -483,6 +549,9 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     total_speed = sum(float(e.get("avg_ego_speed_mps", 0.0)) for e in episodes)
     total_ttc_danger_rate = sum(float(e.get("ttc_danger_rate", 0.0)) for e in episodes)
     total_headway_rate = sum(float(e.get("headway_violation_rate", 0.0)) for e in episodes)
+    total_rear_ttc_danger_rate = sum(float(e.get("rear_ttc_danger_rate", 0.0)) for e in episodes)
+    total_rear_headway_rate = sum(float(e.get("rear_headway_violation_rate", 0.0)) for e in episodes)
+    total_low_speed_blocking_rate = sum(float(e.get("low_speed_blocking_rate", 0.0)) for e in episodes)
     total_lane_change_rate = sum(float(e.get("lane_change_rate", 0.0)) for e in episodes)
     total_flap_rate = sum(float(e.get("flap_accel_decel_rate", 0.0)) for e in episodes)
     total_decision_latency_ms = sum(float(e.get("decision_latency_ms_avg", 0.0)) for e in episodes)
@@ -531,6 +600,9 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
         "avg_ego_speed_mps": round(total_speed / total, 4) if total else None,
         "ttc_danger_rate_mean": round(total_ttc_danger_rate / total, 4) if total else None,
         "headway_violation_rate_mean": round(total_headway_rate / total, 4) if total else None,
+        "rear_ttc_danger_rate_mean": round(total_rear_ttc_danger_rate / total, 4) if total else None,
+        "rear_headway_violation_rate_mean": round(total_rear_headway_rate / total, 4) if total else None,
+        "low_speed_blocking_rate_mean": round(total_low_speed_blocking_rate / total, 4) if total else None,
         "lane_change_rate_mean": round(total_lane_change_rate / total, 4) if total else None,
         "flap_accel_decel_rate_mean": round(total_flap_rate / total, 4) if total else None,
         "format_failure_rate_mean": round(total_format_failures / max(total_decisions, 1), 4),
@@ -698,6 +770,11 @@ def main() -> None:
         config["memory_path"] = args.memory_path
     ttc_threshold_sec = float(config.get("metrics_ttc_threshold_sec", 2.0))
     headway_threshold_m = float(config.get("metrics_headway_threshold_m", 15.0))
+    rear_ttc_threshold_sec = float(config.get("metrics_rear_ttc_threshold_sec", 2.5))
+    rear_headway_threshold_m = float(config.get("metrics_rear_headway_threshold_m", 12.0))
+    low_speed_blocking_threshold_mps = float(config.get("metrics_low_speed_blocking_threshold_mps", 8.5))
+    blocking_front_gap_safe_m = float(config.get("metrics_blocking_front_gap_safe_m", 25.0))
+    blocking_front_ttc_safe_sec = float(config.get("metrics_blocking_front_ttc_safe_sec", 4.0))
     alignment_sample_rate = max(0.0, min(1.0, float(args.alignment_sample_rate)))
     alignment_max_samples = max(0, int(args.alignment_max_samples))
     structured_output = not args.no_structured_output
@@ -793,6 +870,11 @@ def main() -> None:
         "metrics_config": {
             "ttc_threshold_sec": ttc_threshold_sec,
             "headway_threshold_m": headway_threshold_m,
+            "rear_ttc_threshold_sec": rear_ttc_threshold_sec,
+            "rear_headway_threshold_m": rear_headway_threshold_m,
+            "low_speed_blocking_threshold_mps": low_speed_blocking_threshold_mps,
+            "blocking_front_gap_safe_m": blocking_front_gap_safe_m,
+            "blocking_front_ttc_safe_sec": blocking_front_ttc_safe_sec,
             "flapping_mode": "accel_decel",
             "decision_timeout_sec": round(max(1.0, default_decision_timeout_sec), 3),
             "decision_max_output_tokens": int(max(32, default_decision_max_output_tokens)),
@@ -924,6 +1006,11 @@ def main() -> None:
                 temp_dir=temp_dir,
                 ttc_threshold_sec=ttc_threshold_sec,
                 headway_threshold_m=headway_threshold_m,
+                rear_ttc_threshold_sec=rear_ttc_threshold_sec,
+                rear_headway_threshold_m=rear_headway_threshold_m,
+                low_speed_blocking_threshold_mps=low_speed_blocking_threshold_mps,
+                blocking_front_gap_safe_m=blocking_front_gap_safe_m,
+                blocking_front_ttc_safe_sec=blocking_front_ttc_safe_sec,
                 alignment_sample_rate=alignment_sample_rate,
                 alignment_max_samples=alignment_max_samples,
                 slow_decision_threshold_sec=slow_decision_threshold_sec,
@@ -1046,8 +1133,10 @@ def main() -> None:
         print(
             f"- {row['model']}: crashes={row['crashes']}/{row['episodes']} "
             f"(rate={row['crash_rate']}), no_collision_rate={row['no_collision_rate']}, "
-            f"avg_steps={row['avg_steps']}, strict_format_rate={row['response_strict_format_rate']}, "
+                f"avg_steps={row['avg_steps']}, strict_format_rate={row['response_strict_format_rate']}, "
                 f"ttc_danger_rate={row['ttc_danger_rate_mean']}, headway_violation_rate={row['headway_violation_rate_mean']}, "
+                f"rear_ttc_danger_rate={row.get('rear_ttc_danger_rate_mean')}, "
+                f"low_speed_blocking_rate={row.get('low_speed_blocking_rate_mean')}, "
                 f"decision_timeout_rate={row.get('decision_timeout_rate_mean')}, "
                 f"native_timeout_rate={row.get('ollama_native_timeout_rate_mean')}, "
                 f"fallback_action_rate={row.get('fallback_action_rate_mean')}, "

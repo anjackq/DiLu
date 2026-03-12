@@ -108,10 +108,22 @@ List available models:
 python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --results-root results --list-models
 ```
 
-Merge selected models (single experiment only):
+Merge all available models in that experiment:
+
+```bash
+python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --results-root results
+```
+
+Merge selected models only:
 
 ```bash
 python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --models llama3.2:1b llama3.2:3b qwen3.5:0.8b qwen3.5:2b deepseek-r1:1.5b --results-root results
+```
+
+Merge selected models plus all available models (union):
+
+```bash
+python merge_eval_reports.py --experiment-id tier1_lightweight_base_instruct --models qwen3.5:0.8b --include-available --results-root results
 ```
 
 Plot merged report:
