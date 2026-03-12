@@ -1,24 +1,39 @@
 import argparse
 import copy
-import fnmatch
+from contextlib import nullcontext
 import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import gymnasium as gym
 import numpy as np
 import yaml
 from gymnasium.wrappers import RecordVideo
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.markup import escape
 from rich import print
 
 from dilu.driver_agent.driverAgent import DriverAgent
 from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.runtime import (
     configure_runtime_env,
+    resolve_model_policy,
+    apply_model_policy_to_env,
+    build_decision_timeout_penalty_state,
+    update_decision_timeout_penalty_state,
+    decision_timeout_penalty_snapshot,
     build_highway_env_config,
     DEFAULT_DILU_SEEDS,
     ensure_dir,
@@ -60,48 +75,83 @@ def parse_seeds(raw: Optional[str]) -> List[int]:
     return seeds
 
 
-def _as_bool(value, default: bool) -> bool:
-    if value is None:
-        return bool(default)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+def _resolve_quiet_mode(config: Dict, cli_override: Optional[bool], mode: str = "eval") -> bool:
+    def _as_bool(value, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    if cli_override is not None:
+        return bool(cli_override)
+    global_default = _as_bool(config.get("quiet_mode", False), default=False)
+    mode_key = "eval_quiet_mode" if str(mode).strip().lower() == "eval" else "runtime_quiet_mode"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _as_bool(mode_value, default=global_default)
 
 
-def _resolve_model_override(model_name: str, overrides: Dict) -> Dict:
-    if not isinstance(overrides, dict):
-        return {}
-    lower_name = str(model_name or "").strip().lower()
-    if not lower_name:
-        return {}
+def _resolve_progress_mode(config: Dict, cli_override: Optional[bool], mode: str = "eval") -> bool:
+    def _as_bool(value, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    for key, value in overrides.items():
-        if str(key).strip().lower() == lower_name and isinstance(value, dict):
-            return dict(value)
+    if cli_override is not None:
+        return bool(cli_override)
+    global_default = _as_bool(config.get("progress_bar", True), default=True)
+    mode_key = "eval_progress_bar" if str(mode).strip().lower() == "eval" else "runtime_progress_bar"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _as_bool(mode_value, default=global_default)
 
-    best_key = None
-    best_value = None
-    best_len = -1
-    for key, value in overrides.items():
-        if not isinstance(value, dict):
-            continue
-        key_str = str(key).strip()
-        if not key_str:
-            continue
-        key_lower = key_str.lower()
-        matched = False
-        if "*" in key_lower or "?" in key_lower:
-            matched = fnmatch.fnmatchcase(lower_name, key_lower)
-        else:
-            matched = lower_name.startswith(key_lower)
-        if matched and len(key_lower) > best_len:
-            best_key = key_str
-            best_value = value
-            best_len = len(key_lower)
 
-    if best_key is None:
-        return {}
-    return dict(best_value or {})
+def _normalize_progress_reply_mode(value: Optional[str]) -> str:
+    mode = str(value or "off").strip().lower()
+    if mode in {"off", "compact", "full"}:
+        return mode
+    return "off"
+
+
+def _resolve_progress_reply_mode(config: Dict, cli_override: Optional[str], mode: str = "eval") -> str:
+    if cli_override is not None:
+        return _normalize_progress_reply_mode(cli_override)
+    global_default = _normalize_progress_reply_mode(config.get("progress_reply_mode", "off"))
+    mode_key = "eval_progress_reply_mode" if str(mode).strip().lower() == "eval" else "runtime_progress_reply_mode"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _normalize_progress_reply_mode(mode_value)
+
+
+def _normalize_reply_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _compact_reply_preview(step_idx: int, action_id: int, response_text: str, max_len: int = 180) -> str:
+    normalized = _normalize_reply_text(response_text)
+    if not normalized:
+        normalized = "<empty>"
+    if len(normalized) > max_len:
+        normalized = normalized[: max_len - 3] + "..."
+    return f"[dim]      step={step_idx:02d} action={action_id} | {escape(normalized)}[/dim]"
+
+
+def _full_reply_preview(step_idx: int, action_id: int, response_text: str) -> str:
+    body = (response_text or "").strip() or "<empty>"
+    return f"[dim]      step={step_idx:02d} action={action_id}[/dim]\n{escape(body)}"
+
+
+def _is_interactive_output() -> bool:
+    try:
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        return False
 
 
 def _safe_int_action(action) -> int:
@@ -228,10 +278,14 @@ def run_episode(
     alignment_sample_rate: float,
     alignment_max_samples: int,
     slow_decision_threshold_sec: float,
+    timeout_penalty_state: Optional[Dict] = None,
     save_artifacts: bool = False,
     run_dir: Optional[str] = None,
     run_id: Optional[str] = None,
     model_name: Optional[str] = None,
+    quiet_mode: bool = False,
+    on_step: Optional[Callable[[int, bool], None]] = None,
+    on_decision: Optional[Callable[[int, int, str, Dict], None]] = None,
 ) -> Dict:
     env_type = "highway-v0"
     env = None
@@ -281,6 +335,26 @@ def run_episode(
     alignment_samples = []
     decision_latencies_sec = []
     slow_decision_count = 0
+    penalty_start_events = (
+        int(timeout_penalty_state.get("penalty_events", 0))
+        if isinstance(timeout_penalty_state, dict)
+        else 0
+    )
+    penalty_start_timeout_triggers = (
+        int(timeout_penalty_state.get("timeout_triggers", 0))
+        if isinstance(timeout_penalty_state, dict)
+        else 0
+    )
+    penalty_start_slow_triggers = (
+        int(timeout_penalty_state.get("slow_triggers", 0))
+        if isinstance(timeout_penalty_state, dict)
+        else 0
+    )
+    timeout_penalty_stage_max = (
+        int(timeout_penalty_state.get("stage", 0))
+        if isinstance(timeout_penalty_state, dict)
+        else 0
+    )
 
     try:
         env = gym.make(env_type, render_mode="rgb_array")
@@ -300,7 +374,15 @@ def run_episode(
         final_info = info
 
         sce = EnvScenario(env, env_type, seed, database_path)
-        agent = DriverAgent(sce, verbose=False)
+        agent = DriverAgent(sce, verbose=True)
+        initial_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+        if initial_penalty_snapshot.get("enabled") and initial_penalty_snapshot.get("effective_decision_timeout_sec") is not None:
+            try:
+                agent.set_decision_timeout_sec(
+                    float(initial_penalty_snapshot["effective_decision_timeout_sec"])
+                )
+            except Exception:
+                pass
 
         prev_action = "Not available"
         for frame_id in range(config["simulation_duration"]):
@@ -347,6 +429,26 @@ def run_episode(
             ollama_native_timeout_short_circuit_count += int(ollama_native_timeout_short_circuit)
             decision_latencies_sec.append(decision_elapsed_sec)
             slow_decision_count += int(decision_elapsed_sec >= max(0.001, slow_decision_threshold_sec))
+            penalty_update = update_decision_timeout_penalty_state(
+                timeout_penalty_state,
+                timed_out=timed_out,
+                decision_elapsed_sec=decision_elapsed_sec,
+                slow_threshold_sec=slow_decision_threshold_sec,
+            )
+            timeout_penalty_stage_max = max(timeout_penalty_stage_max, int(penalty_update.get("stage", 0)))
+            if penalty_update.get("escalated"):
+                effective_decision_timeout_sec = penalty_update.get("effective_decision_timeout_sec")
+                if effective_decision_timeout_sec is not None:
+                    try:
+                        agent.set_decision_timeout_sec(float(effective_decision_timeout_sec))
+                    except Exception:
+                        pass
+                if not quiet_mode:
+                    print(
+                        "[yellow]Adaptive timeout penalty escalated[/yellow] "
+                        f"(reason={penalty_update.get('reason')}, stage={penalty_update.get('stage')}, "
+                        f"decision_timeout={round(float(effective_decision_timeout_sec), 3) if effective_decision_timeout_sec is not None else 'n/a'}s)"
+                    )
             if ollama_effective_mode:
                 ollama_effective_think_modes_seen.add(str(ollama_effective_mode))
             if timed_out and first_timeout_step is None:
@@ -359,6 +461,11 @@ def run_episode(
             format_failure_count += int(not fmt["strict_format_match"])
 
             action = _safe_int_action(action)
+            if on_decision is not None:
+                try:
+                    on_decision(int(frame_id + 1), int(action), response, dict(decision_meta))
+                except Exception:
+                    pass
             lane_change_count += int(action in (0, 2))
             if prev_action_id is not None and ((prev_action_id == 3 and action == 4) or (prev_action_id == 4 and action == 3)):
                 flap_accel_decel_count += 1
@@ -378,6 +485,11 @@ def run_episode(
             crashed = bool(info.get("crashed", False))
             done = terminated or truncated
             steps += 1
+            if on_step is not None:
+                try:
+                    on_step(int(steps), bool(done))
+                except Exception:
+                    pass
             episode_reward_sum += float(reward)
 
             step_metrics = extract_step_traffic_metrics(
@@ -441,6 +553,22 @@ def run_episode(
     ollama_openai_fallback_rate = ollama_openai_fallback_count / max(decision_calls_total, 1)
     p95_decision_latency_sec = float(np.percentile(decision_latencies_sec, 95)) if decision_latencies_sec else 0.0
     timeout_triggered = decision_timeout_count > 0
+    penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+    timeout_penalty_events = (
+        int(penalty_snapshot.get("penalty_events", 0)) - penalty_start_events
+        if penalty_snapshot.get("enabled")
+        else 0
+    )
+    timeout_penalty_timeout_triggers = (
+        int(penalty_snapshot.get("timeout_triggers", 0)) - penalty_start_timeout_triggers
+        if penalty_snapshot.get("enabled")
+        else 0
+    )
+    timeout_penalty_slow_triggers = (
+        int(penalty_snapshot.get("slow_triggers", 0)) - penalty_start_slow_triggers
+        if penalty_snapshot.get("enabled")
+        else 0
+    )
 
     if episode_stop_reason != "error":
         if crashed:
@@ -482,6 +610,21 @@ def run_episode(
         "ollama_downgrade_triggered": bool(ollama_native_retry_count > 0 or ("auto" in ollama_effective_think_modes_seen and ollama_requested_think_mode == "think")),
         "slow_decision_count": int(slow_decision_count),
         "p95_decision_latency_sec": round(p95_decision_latency_sec, 4),
+        "timeout_penalty_stage_max": int(timeout_penalty_stage_max),
+        "timeout_penalty_events": int(max(0, timeout_penalty_events)),
+        "timeout_penalty_timeout_triggers": int(max(0, timeout_penalty_timeout_triggers)),
+        "timeout_penalty_slow_triggers": int(max(0, timeout_penalty_slow_triggers)),
+        "timeout_penalty_final_decision_timeout_sec": (
+            round(float(penalty_snapshot.get("effective_decision_timeout_sec")), 4)
+            if penalty_snapshot.get("effective_decision_timeout_sec") is not None
+            else None
+        ),
+        # Deprecated alias for one transition cycle.
+        "timeout_penalty_final_native_timeout_sec": (
+            round(float(penalty_snapshot.get("effective_decision_timeout_sec")), 4)
+            if penalty_snapshot.get("effective_decision_timeout_sec") is not None
+            else None
+        ),
         "decisions_made": decisions_made,
         "responses_with_delimiter": responses_with_delimiter,
         "responses_strict_format": responses_strict_format,
@@ -555,6 +698,19 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     total_lane_change_rate = sum(float(e.get("lane_change_rate", 0.0)) for e in episodes)
     total_flap_rate = sum(float(e.get("flap_accel_decel_rate", 0.0)) for e in episodes)
     total_decision_latency_ms = sum(float(e.get("decision_latency_ms_avg", 0.0)) for e in episodes)
+    total_timeout_penalty_events = sum(int(e.get("timeout_penalty_events", 0)) for e in episodes)
+    total_timeout_penalty_timeout_triggers = sum(
+        int(e.get("timeout_penalty_timeout_triggers", 0)) for e in episodes
+    )
+    total_timeout_penalty_slow_triggers = sum(
+        int(e.get("timeout_penalty_slow_triggers", 0)) for e in episodes
+    )
+    timeout_penalty_stage_max_values = [int(e.get("timeout_penalty_stage_max", 0)) for e in episodes]
+    timeout_penalty_final_values = [
+        float(e.get("timeout_penalty_final_decision_timeout_sec"))
+        for e in episodes
+        if e.get("timeout_penalty_final_decision_timeout_sec") is not None
+    ]
 
     return {
         "model": model_name,
@@ -607,6 +763,24 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
         "flap_accel_decel_rate_mean": round(total_flap_rate / total, 4) if total else None,
         "format_failure_rate_mean": round(total_format_failures / max(total_decisions, 1), 4),
         "decision_latency_ms_avg": round(total_decision_latency_ms / total, 3) if total else None,
+        "timeout_penalty_events_total": int(total_timeout_penalty_events),
+        "timeout_penalty_timeout_triggers_total": int(total_timeout_penalty_timeout_triggers),
+        "timeout_penalty_slow_triggers_total": int(total_timeout_penalty_slow_triggers),
+        "timeout_penalty_events_rate_mean": round(total_timeout_penalty_events / max(total_decision_calls, 1), 4),
+        "timeout_penalty_stage_max_mean": (
+            round(sum(timeout_penalty_stage_max_values) / max(total, 1), 4)
+            if total else None
+        ),
+        "timeout_penalty_stage_max_global": max(timeout_penalty_stage_max_values) if timeout_penalty_stage_max_values else 0,
+        "timeout_penalty_final_decision_timeout_sec_mean": (
+            round(sum(timeout_penalty_final_values) / len(timeout_penalty_final_values), 4)
+            if timeout_penalty_final_values else None
+        ),
+        # Deprecated alias for one transition cycle.
+        "timeout_penalty_final_native_timeout_sec_mean": (
+            round(sum(timeout_penalty_final_values) / len(timeout_penalty_final_values), 4)
+            if timeout_penalty_final_values else None
+        ),
     }
 
 
@@ -615,7 +789,7 @@ def _append_eval_run_log(log_path: str, model_name: str, episode: Dict) -> None:
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             "Model {model} | Seed {seed} | Stop {stop} | Steps {steps}/{max_steps} | "
-            "Crash {crashed} | Error {error} | Runtime {runtime}s | DB {db} | Video {video}\n".format(
+            "Crash {crashed} | Error {error} | Runtime {runtime}s | Penalty(stage={stage},events={events},decision_timeout={timeout}s) | DB {db} | Video {video}\n".format(
                 model=model_name,
                 seed=episode.get("seed"),
                 stop=episode.get("episode_stop_reason"),
@@ -624,6 +798,9 @@ def _append_eval_run_log(log_path: str, model_name: str, episode: Dict) -> None:
                 crashed=episode.get("crashed"),
                 error=episode.get("error"),
                 runtime=episode.get("episode_runtime_sec"),
+                stage=episode.get("timeout_penalty_stage_max"),
+                events=episode.get("timeout_penalty_events"),
+                timeout=episode.get("timeout_penalty_final_decision_timeout_sec"),
                 db=episode.get("database_path"),
                 video=episode.get("video_prefix"),
             )
@@ -745,19 +922,49 @@ def main() -> None:
     parser.add_argument("--no-structured-output", action="store_true", help="Disable structured experiment/model outputs.")
     parser.add_argument("--save-run-artifacts", action="store_true", help="Save run-style artifacts (video/db/log/run_metrics) per model during evaluation.")
     parser.add_argument("--eval-run-id", default=None, help="Run id used under models/<slug>/runs/<eval_run_id> when --save-run-artifacts is enabled.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress high-frequency step/decision logs.")
+    parser.add_argument("--no-quiet", action="store_true", help="Force step/decision logs on even if config quiet mode is enabled.")
+    parser.add_argument("--progress", action="store_true", help="Show CLI progress bars.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable CLI progress bars.")
+    parser.add_argument(
+        "--progress-replies",
+        choices=["off", "compact", "full"],
+        help="Show LLM replies while progress bars are active.",
+    )
     parser.add_argument("--decision-timeout-sec", type=float, default=None, help="Hard timeout per model decision call. Default: config eval_decision_timeout_sec or 60.")
-    parser.add_argument("--decision-max-output-tokens", type=int, default=None, help="Per-decision max output tokens. Default: config eval_decision_max_output_tokens or 512.")
-    parser.add_argument("--disable-streaming", action="store_true", help="Disable streaming inference in evaluation to reduce hangs.")
-    parser.add_argument("--disable-checker-llm", action="store_true", help="Disable second checker LLM call; use local parse/fallback only.")
-    parser.add_argument("--ollama-think-mode", choices=["auto", "think", "no_think"], default=None, help="Ollama native think mode override for driver agent.")
-    parser.add_argument("--ollama-use-native-chat", action="store_true", help="Force native Ollama /api/chat driver path.")
-    parser.add_argument("--ollama-disable-native-chat", action="store_true", help="Disable native Ollama /api/chat and use OpenAI-compatible /v1 path.")
+    parser.add_argument("--decision-max-output-tokens", type=int, default=None, help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--disable-streaming", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--disable-checker-llm", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--ollama-think-mode", choices=["auto", "think", "no_think"], default=None, help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--ollama-use-native-chat", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--ollama-disable-native-chat", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
     parser.add_argument("--alignment-sample-rate", type=float, default=0.0, help="Sampling probability [0,1] for reasoning-alignment sample collection.")
     parser.add_argument("--alignment-max-samples", type=int, default=0, help="Max alignment samples per model.")
     args = parser.parse_args()
+    if args.quiet and args.no_quiet:
+        raise ValueError("Use only one of --quiet or --no-quiet.")
+    if args.progress and args.no_progress:
+        raise ValueError("Use only one of --progress or --no-progress.")
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    cli_quiet_override = True if args.quiet else (False if args.no_quiet else None)
+    resolved_eval_quiet_mode = _resolve_quiet_mode(config, cli_quiet_override, mode="eval")
+    cli_progress_override = True if args.progress else (False if args.no_progress else None)
+    resolved_eval_progress_mode = _resolve_progress_mode(config, cli_progress_override, mode="eval")
+    progress_enabled = bool(resolved_eval_progress_mode and _is_interactive_output())
+    resolved_eval_progress_reply_mode = _resolve_progress_reply_mode(
+        config,
+        args.progress_replies,
+        mode="eval",
+    )
+    effective_eval_progress_reply_mode = (
+        resolved_eval_progress_reply_mode
+        if (progress_enabled and (not resolved_eval_quiet_mode))
+        else "off"
+    )
+    step_log_quiet_mode = bool(resolved_eval_quiet_mode or progress_enabled)
 
     seeds = parse_seeds(args.seeds)
     if args.limit is not None:
@@ -789,37 +996,87 @@ def main() -> None:
     if save_run_artifacts and not structured_output:
         raise ValueError("--save-run-artifacts requires structured output. Remove --no-structured-output.")
     default_decision_timeout_sec = float(config.get("eval_decision_timeout_sec", 60.0))
-    default_decision_max_output_tokens = int(config.get("eval_decision_max_output_tokens", 512))
-    default_disable_streaming = bool(config.get("eval_disable_streaming", True))
-    default_disable_checker_llm = bool(config.get("eval_disable_checker_llm", True))
-    default_ollama_think_mode = str(config.get("OLLAMA_THINK_MODE", "auto")).strip().lower()
-    if default_ollama_think_mode not in {"auto", "think", "no_think"}:
-        default_ollama_think_mode = "auto"
-    default_ollama_use_native_chat = bool(config.get("OLLAMA_USE_NATIVE_CHAT", True))
-    default_ollama_native_chat_timeout_sec = float(
-        config.get("OLLAMA_NATIVE_CHAT_TIMEOUT_SEC", default_decision_timeout_sec)
-    )
     slow_decision_threshold_sec = float(config.get("eval_slow_decision_threshold_sec", 5.0))
-    model_overrides = config.get("eval_model_overrides", {})
-    if not isinstance(model_overrides, dict):
-        model_overrides = {}
+    adaptive_timeout_penalty_enabled = bool(config.get("adaptive_timeout_penalty_enabled", True))
+    adaptive_timeout_halving_factor = float(config.get("adaptive_timeout_halving_factor", 0.5))
+    if adaptive_timeout_halving_factor <= 0.0 or adaptive_timeout_halving_factor >= 1.0:
+        adaptive_timeout_halving_factor = 0.5
+    adaptive_timeout_min_sec = float(config.get("adaptive_timeout_min_sec", 4.0))
+    adaptive_timeout_min_sec = max(1.0, adaptive_timeout_min_sec)
+    adaptive_timeout_trigger_consecutive_slow = int(
+        config.get("adaptive_timeout_trigger_consecutive_slow", 2)
+    )
+    adaptive_timeout_trigger_consecutive_slow = max(1, adaptive_timeout_trigger_consecutive_slow)
+    provider = str(config.get("OPENAI_API_TYPE", "")).strip().lower()
+    shared_policy_overrides = config.get("model_policy_overrides", {})
+    if not isinstance(shared_policy_overrides, dict):
+        shared_policy_overrides = {}
+    legacy_eval_overrides = config.get("eval_model_overrides", {})
+    if not isinstance(legacy_eval_overrides, dict):
+        legacy_eval_overrides = {}
+    deprecated_override_fields_declared = sorted(
+        {
+            key
+            for override_map in (shared_policy_overrides, legacy_eval_overrides)
+            for value in override_map.values()
+            if isinstance(value, dict)
+            for key in value.keys()
+            if key
+            in {
+                "decision_max_output_tokens",
+                "disable_streaming",
+                "disable_checker_llm",
+                "ollama_think_mode",
+                "ollama_use_native_chat",
+                "ollama_native_chat_timeout_sec",
+            }
+        }
+    )
+    if deprecated_override_fields_declared:
+        print(
+            "[yellow]Deprecated output-affecting policy fields were found in config overrides and will be ignored "
+            f"(timeout-only policy): {', '.join(deprecated_override_fields_declared)}[/yellow]"
+        )
 
     cli_decision_timeout_sec = (
         float(args.decision_timeout_sec) if args.decision_timeout_sec is not None else None
     )
-    cli_decision_max_output_tokens = (
-        int(args.decision_max_output_tokens) if args.decision_max_output_tokens is not None else None
-    )
+    cli_decision_max_output_tokens = int(args.decision_max_output_tokens) if args.decision_max_output_tokens is not None else None
     cli_disable_streaming = bool(args.disable_streaming)
     cli_disable_checker_llm = bool(args.disable_checker_llm)
     cli_ollama_think_mode = str(args.ollama_think_mode).strip().lower() if args.ollama_think_mode else None
-    if cli_ollama_think_mode and cli_ollama_think_mode not in {"auto", "think", "no_think"}:
-        cli_ollama_think_mode = "auto"
-    cli_ollama_use_native_chat = None
-    if args.ollama_use_native_chat:
-        cli_ollama_use_native_chat = True
-    if args.ollama_disable_native_chat:
-        cli_ollama_use_native_chat = False
+    cli_ollama_use_native_chat = bool(args.ollama_use_native_chat or args.ollama_disable_native_chat)
+    cli_policy_overrides = {}
+    if cli_decision_timeout_sec is not None:
+        cli_policy_overrides["decision_timeout_sec"] = float(cli_decision_timeout_sec)
+    if cli_decision_max_output_tokens is not None:
+        cli_policy_overrides["decision_max_output_tokens"] = int(cli_decision_max_output_tokens)
+    if cli_disable_streaming:
+        cli_policy_overrides["disable_streaming"] = True
+    if cli_disable_checker_llm:
+        cli_policy_overrides["disable_checker_llm"] = True
+    if cli_ollama_think_mode:
+        cli_policy_overrides["ollama_think_mode"] = cli_ollama_think_mode
+    if cli_ollama_use_native_chat:
+        cli_policy_overrides["ollama_use_native_chat"] = True
+    deprecated_cli_policy_flags = sorted(
+        [
+            name
+            for name, enabled in {
+                "decision_max_output_tokens": cli_decision_max_output_tokens is not None,
+                "disable_streaming": cli_disable_streaming,
+                "disable_checker_llm": cli_disable_checker_llm,
+                "ollama_think_mode": bool(cli_ollama_think_mode),
+                "ollama_use_native_chat": bool(cli_ollama_use_native_chat),
+            }.items()
+            if enabled
+        ]
+    )
+    if deprecated_cli_policy_flags:
+        print(
+            "[yellow]Deprecated policy CLI flags were provided and will be ignored "
+            f"(timeout-only policy): {', '.join(deprecated_cli_policy_flags)}[/yellow]"
+        )
 
     config["eval_save_run_artifacts"] = bool(save_run_artifacts)
     config["eval_run_id"] = eval_run_id
@@ -877,15 +1134,27 @@ def main() -> None:
             "blocking_front_ttc_safe_sec": blocking_front_ttc_safe_sec,
             "flapping_mode": "accel_decel",
             "decision_timeout_sec": round(max(1.0, default_decision_timeout_sec), 3),
-            "decision_max_output_tokens": int(max(32, default_decision_max_output_tokens)),
-            "disable_streaming": bool(default_disable_streaming),
-            "disable_checker_llm": bool(default_disable_checker_llm),
-            "ollama_think_mode": default_ollama_think_mode,
-            "ollama_use_native_chat": bool(default_ollama_use_native_chat),
-            "ollama_native_chat_timeout_sec": round(max(1.0, default_ollama_native_chat_timeout_sec), 3),
             "slow_decision_threshold_sec": round(max(0.001, slow_decision_threshold_sec), 3),
-            "model_overrides_enabled": bool(model_overrides),
-            "model_overrides_keys": sorted(list(model_overrides.keys())),
+            "model_overrides_enabled": bool(legacy_eval_overrides),
+            "model_overrides_keys": sorted(list(legacy_eval_overrides.keys())),
+            "model_policy_overrides_enabled": bool(shared_policy_overrides),
+            "model_policy_overrides_keys": sorted(list(shared_policy_overrides.keys())),
+            "adaptive_timeout_penalty_enabled": bool(adaptive_timeout_penalty_enabled),
+            "adaptive_timeout_halving_factor": float(adaptive_timeout_halving_factor),
+            "adaptive_timeout_min_sec": float(adaptive_timeout_min_sec),
+            "adaptive_timeout_trigger_consecutive_slow": int(adaptive_timeout_trigger_consecutive_slow),
+            "quiet_mode": bool(resolved_eval_quiet_mode),
+            "progress_bar": bool(progress_enabled),
+            "progress_bar_requested": bool(resolved_eval_progress_mode),
+            "progress_reply_mode_requested": str(resolved_eval_progress_reply_mode),
+            "progress_reply_mode_effective": str(effective_eval_progress_reply_mode),
+            "policy_mode": "timeout_only",
+            "deprecated_policy_cli_fields_ignored": deprecated_cli_policy_flags,
+            "deprecated_policy_override_fields_ignored": deprecated_override_fields_declared,
+            "deprecated_metric_aliases": {
+                "timeout_penalty_final_native_timeout_sec": "timeout_penalty_final_decision_timeout_sec",
+                "timeout_penalty_final_native_timeout_sec_mean": "timeout_penalty_final_decision_timeout_sec_mean",
+            },
             "save_run_artifacts": bool(save_run_artifacts),
             "eval_run_id": eval_run_id if save_run_artifacts else None,
             "alignment_sample_rate": alignment_sample_rate,
@@ -902,168 +1171,246 @@ def main() -> None:
     aggregate_by_model: Dict[str, Dict] = {}
     model_run_outputs: Dict[str, Dict[str, str]] = {}
     model_metrics_configs: Dict[str, Dict] = {}
-    for model_name in args.models:
-        model_override = _resolve_model_override(model_name, model_overrides)
-        resolved_decision_timeout_sec = float(
-            cli_decision_timeout_sec
-            if cli_decision_timeout_sec is not None
-            else model_override.get("decision_timeout_sec", default_decision_timeout_sec)
+    deprecated_policy_fields_ignored_union = set(deprecated_cli_policy_flags)
+    progress_cm = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=False,
         )
-        resolved_decision_timeout_sec = max(1.0, resolved_decision_timeout_sec)
-        resolved_decision_max_output_tokens = int(
-            cli_decision_max_output_tokens
-            if cli_decision_max_output_tokens is not None
-            else model_override.get("decision_max_output_tokens", default_decision_max_output_tokens)
+        if progress_enabled
+        else nullcontext(None)
+    )
+    with progress_cm as progress:
+        emit = progress.console.print if progress is not None else print
+        model_task = (
+            progress.add_task("Models", total=len(args.models))
+            if progress is not None
+            else None
         )
-        resolved_decision_max_output_tokens = max(32, resolved_decision_max_output_tokens)
-        resolved_disable_streaming = (
-            True if cli_disable_streaming else _as_bool(model_override.get("disable_streaming"), default_disable_streaming)
-        )
-        resolved_disable_checker_llm = (
-            True if cli_disable_checker_llm else _as_bool(model_override.get("disable_checker_llm"), default_disable_checker_llm)
-        )
-        resolved_ollama_think_mode = str(
-            cli_ollama_think_mode
-            if cli_ollama_think_mode is not None
-            else model_override.get("ollama_think_mode", default_ollama_think_mode)
-        ).strip().lower()
-        if resolved_ollama_think_mode not in {"auto", "think", "no_think"}:
-            resolved_ollama_think_mode = "auto"
-        resolved_ollama_use_native_chat = (
-            cli_ollama_use_native_chat
-            if cli_ollama_use_native_chat is not None
-            else _as_bool(model_override.get("ollama_use_native_chat"), default_ollama_use_native_chat)
-        )
-        resolved_ollama_native_chat_timeout_sec = float(
-            model_override.get("ollama_native_chat_timeout_sec", default_ollama_native_chat_timeout_sec)
-        )
-        resolved_ollama_native_chat_timeout_sec = max(1.0, resolved_ollama_native_chat_timeout_sec)
 
-        # Apply resolved model policy for this model before env/provider setup.
-        config["OLLAMA_THINK_MODE"] = resolved_ollama_think_mode
-        config["OLLAMA_USE_NATIVE_CHAT"] = bool(resolved_ollama_use_native_chat)
-        config["OLLAMA_NATIVE_CHAT_TIMEOUT_SEC"] = float(resolved_ollama_native_chat_timeout_sec)
-        os.environ["DILU_DECISION_TIMEOUT_SEC"] = str(resolved_decision_timeout_sec)
-        os.environ["DILU_MAX_OUTPUT_TOKENS"] = str(resolved_decision_max_output_tokens)
-        os.environ["DILU_USE_STREAMING"] = "0" if resolved_disable_streaming else "1"
-        os.environ["DILU_ENABLE_CHECKER_LLM"] = "0" if resolved_disable_checker_llm else "1"
-        os.environ["OLLAMA_THINK_MODE"] = resolved_ollama_think_mode
-        os.environ["OLLAMA_USE_NATIVE_CHAT"] = "1" if resolved_ollama_use_native_chat else "0"
-        os.environ["OLLAMA_NATIVE_CHAT_TIMEOUT_SEC"] = str(resolved_ollama_native_chat_timeout_sec)
-        report["model_runtime_policies"][model_name] = {
-            "matched_override": model_override,
-            "decision_timeout_sec": round(resolved_decision_timeout_sec, 3),
-            "decision_max_output_tokens": int(resolved_decision_max_output_tokens),
-            "disable_streaming": bool(resolved_disable_streaming),
-            "disable_checker_llm": bool(resolved_disable_checker_llm),
-            "ollama_think_mode": resolved_ollama_think_mode,
-            "ollama_use_native_chat": bool(resolved_ollama_use_native_chat),
-            "ollama_native_chat_timeout_sec": round(resolved_ollama_native_chat_timeout_sec, 3),
-        }
-        model_metrics_configs[model_name] = {
-            **dict(report["metrics_config"]),
-            "resolved_model_policy": dict(report["model_runtime_policies"][model_name]),
-        }
-        print(f"\n[bold cyan]Evaluating model[/bold cyan]: {model_name}")
-        print(
-            "[dim]  Policy: timeout={timeout}s, max_tokens={tokens}, streaming={streaming}, "
-            "checker={checker}, think_mode={think}, native_chat={native}, native_timeout={native_timeout}s[/dim]".format(
-                timeout=round(resolved_decision_timeout_sec, 3),
-                tokens=int(resolved_decision_max_output_tokens),
-                streaming=not resolved_disable_streaming,
-                checker=not resolved_disable_checker_llm,
-                think=resolved_ollama_think_mode,
-                native=bool(resolved_ollama_use_native_chat),
-                native_timeout=round(resolved_ollama_native_chat_timeout_sec, 3),
-            )
-        )
-        configure_runtime_env(config, chat_model_override=model_name)
-        agent_memory = DrivingMemory(db_path=config["memory_path"])
-        model_run_dir = None
-        model_log_path = None
-        if save_run_artifacts:
-            model_run_dir = build_model_run_dir(experiment_root, model_name, eval_run_id)
-            model_log_path = os.path.join(model_run_dir, "log.txt")
-            with open(model_log_path, "a", encoding="utf-8") as f:
-                f.write(
-                    "=== Eval Run {run_id} | Model {model} | Created {created} ===\n".format(
-                        run_id=eval_run_id,
-                        model=model_name,
-                        created=datetime.now().isoformat(timespec="seconds"),
-                    )
-                )
-
-        episodes = []
-        model_alignment_samples = []
-        for idx, seed in enumerate(seeds, start=1):
-            print(f"[dim]  Seed {idx}/{len(seeds)}: {seed}[/dim]")
-            episode_result = run_episode(
+        for model_name in args.models:
+            resolved_policy = resolve_model_policy(
                 config=config,
-                env_config=env_config,
-                agent_memory=agent_memory,
-                seed=seed,
-                few_shot_num=few_shot_num,
-                temp_dir=temp_dir,
-                ttc_threshold_sec=ttc_threshold_sec,
-                headway_threshold_m=headway_threshold_m,
-                rear_ttc_threshold_sec=rear_ttc_threshold_sec,
-                rear_headway_threshold_m=rear_headway_threshold_m,
-                low_speed_blocking_threshold_mps=low_speed_blocking_threshold_mps,
-                blocking_front_gap_safe_m=blocking_front_gap_safe_m,
-                blocking_front_ttc_safe_sec=blocking_front_ttc_safe_sec,
-                alignment_sample_rate=alignment_sample_rate,
-                alignment_max_samples=alignment_max_samples,
-                slow_decision_threshold_sec=slow_decision_threshold_sec,
-                save_artifacts=save_run_artifacts,
-                run_dir=model_run_dir,
-                run_id=eval_run_id if save_run_artifacts else None,
                 model_name=model_name,
+                provider=provider,
+                mode="eval",
+                cli_overrides=cli_policy_overrides,
             )
-            episode_alignment_samples = episode_result.pop("alignment_samples", [])
-            for sample in episode_alignment_samples:
-                sample["model"] = model_name
-                model_alignment_samples.append(sample)
-            episodes.append(episode_result)
-            if save_run_artifacts and model_log_path:
-                _append_eval_run_log(model_log_path, model_name, episode_result)
-            status = "CRASH" if episode_result["crashed"] else ("ERROR" if episode_result["error"] else ("TIMEOUT" if episode_result.get("timeout_triggered") else "OK"))
-            print(
-                f"    -> {status} | steps={episode_result['steps']}/{episode_result['max_steps']} "
-                f"| t={episode_result['episode_runtime_sec']}s | timeout_steps={episode_result.get('decision_timeout_count', 0)}"
+            policy_meta = dict(resolved_policy.get("policy_meta", {}))
+            deprecated_policy_fields_ignored_union.update(
+                policy_meta.get("deprecated_policy_fields_ignored", []) or []
             )
-            if episode_result["error"]:
-                print(f"    -> [red]{episode_result['error']}[/red]")
+            resolved_decision_timeout_sec = float(resolved_policy["decision_timeout_sec"])
+            timeout_penalty_state = build_decision_timeout_penalty_state(
+                config=config,
+                provider=provider,
+                mode="eval",
+                baseline_decision_timeout_sec=resolved_decision_timeout_sec,
+            )
 
-        report["per_model"][model_name] = episodes
-        agg = aggregate_results(model_name, episodes)
-        report["aggregates"].append(agg)
-        aggregate_by_model[model_name] = agg
-        report["alignment_samples"].extend(model_alignment_samples[:alignment_max_samples] if alignment_max_samples > 0 else [])
-        if save_run_artifacts and model_run_dir:
-            run_metrics_report = _build_eval_run_metrics_report(
-                model_name=model_name,
-                experiment_id=experiment_id,
-                experiment_root=experiment_root,
-                run_id=eval_run_id,
-                run_dir=model_run_dir,
-                config_path=args.config,
-                openai_api_type=str(config.get("OPENAI_API_TYPE", "")),
-                few_shot_num=int(few_shot_num),
-                memory_path=str(config.get("memory_path", "")),
-                simulation_duration=int(config["simulation_duration"]),
-                metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
-                episodes=episodes,
-                aggregate=agg,
+            configure_runtime_env(
+                config,
+                chat_model_override=model_name,
+                mode="eval",
+                quiet_override=step_log_quiet_mode,
+                progress_override=progress_enabled,
             )
-            run_metrics_path = timestamped_results_path("run_metrics", ext=".json", results_dir=model_run_dir)
-            write_json_atomic(run_metrics_path, run_metrics_report)
-            model_run_outputs[model_name] = {
-                "run_id": eval_run_id,
-                "run_dir": model_run_dir,
-                "log_path": model_log_path,
-                "run_metrics": run_metrics_path,
+            apply_model_policy_to_env(resolved_policy, provider=provider)
+
+            report["model_runtime_policies"][model_name] = {
+                "decision_timeout_sec": round(resolved_decision_timeout_sec, 3),
+                "policy_meta": policy_meta,
+                "matched_override": {
+                    "model_policy": policy_meta.get("matched_model_policy_override_key"),
+                    "legacy_eval_model": policy_meta.get("matched_eval_model_override_key"),
+                },
+                "deprecated_policy_fields_ignored": policy_meta.get("deprecated_policy_fields_ignored", []),
+                "decision_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
+                # Deprecated alias key for one transition cycle.
+                "native_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
             }
+            model_metrics_configs[model_name] = {
+                **dict(report["metrics_config"]),
+                "resolved_model_policy": dict(report["model_runtime_policies"][model_name]),
+            }
+            emit(f"\n[bold cyan]Evaluating model[/bold cyan]: {model_name}")
+            source_parts = []
+            if policy_meta.get("matched_model_policy_override_key"):
+                source_parts.append(f"model_override={policy_meta['matched_model_policy_override_key']}")
+            if policy_meta.get("matched_eval_model_override_key"):
+                source_parts.append(f"legacy_eval_override={policy_meta['matched_eval_model_override_key']}")
+            if policy_meta.get("cli_override_keys"):
+                source_parts.append(f"cli={','.join(policy_meta['cli_override_keys'])}")
+            source_label = " | ".join(source_parts) if source_parts else "base_defaults"
+            emit(
+                "[dim]  Policy (timeout-only): decision_timeout={timeout}s | source={source}[/dim]".format(
+                    timeout=round(resolved_decision_timeout_sec, 3),
+                    source=source_label,
+                )
+            )
+            if policy_meta.get("deprecated_policy_fields_ignored"):
+                emit(
+                    "[yellow]  Deprecated policy fields ignored:[/yellow] "
+                    f"{', '.join(policy_meta['deprecated_policy_fields_ignored'])}"
+                )
+            penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+            emit(
+                "[dim]  Adaptive decision-timeout penalty: enabled={enabled}, baseline={baseline}s, floor={floor}s, "
+                "factor={factor}, trigger_consecutive_slow={trigger}[/dim]".format(
+                    enabled=bool(penalty_snapshot.get("enabled")),
+                    baseline=round(float(penalty_snapshot.get("baseline_decision_timeout_sec") or 0.0), 3),
+                    floor=round(float(penalty_snapshot.get("min_timeout_sec") or 0.0), 3),
+                    factor=round(float(penalty_snapshot.get("halving_factor") or 0.0), 3),
+                    trigger=int(penalty_snapshot.get("trigger_consecutive_slow") or 0),
+                )
+            )
+            agent_memory = DrivingMemory(db_path=config["memory_path"])
+            model_run_dir = None
+            model_log_path = None
+            if save_run_artifacts:
+                model_run_dir = build_model_run_dir(experiment_root, model_name, eval_run_id)
+                model_log_path = os.path.join(model_run_dir, "log.txt")
+                with open(model_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        "=== Eval Run {run_id} | Model {model} | Created {created} ===\n".format(
+                            run_id=eval_run_id,
+                            model=model_name,
+                            created=datetime.now().isoformat(timespec="seconds"),
+                        )
+                    )
 
+            seed_task = (
+                progress.add_task(f"{model_name} seeds", total=len(seeds))
+                if progress is not None
+                else None
+            )
+            step_task = (
+                progress.add_task(f"{model_name} steps", total=int(config["simulation_duration"]))
+                if progress is not None
+                else None
+            )
+            episodes = []
+            model_alignment_samples = []
+            for idx, seed in enumerate(seeds, start=1):
+                emit(f"[dim]  Seed {idx}/{len(seeds)}: {seed}[/dim]")
+                if progress is not None and step_task is not None:
+                    progress.update(
+                        step_task,
+                        description=f"{model_name} | seed {idx}/{len(seeds)}",
+                        total=int(config["simulation_duration"]),
+                        completed=0,
+                    )
+
+                def _on_step(step_completed: int, done: bool) -> None:
+                    if progress is not None and step_task is not None:
+                        progress.update(
+                            step_task,
+                            completed=min(int(step_completed), int(config["simulation_duration"])),
+                        )
+
+                def _on_decision(step_idx: int, action_id: int, response_text: str, _decision_meta: Dict) -> None:
+                    if effective_eval_progress_reply_mode == "compact":
+                        emit(_compact_reply_preview(step_idx, action_id, response_text))
+                    elif effective_eval_progress_reply_mode == "full":
+                        emit(_full_reply_preview(step_idx, action_id, response_text))
+
+                episode_result = run_episode(
+                    config=config,
+                    env_config=env_config,
+                    agent_memory=agent_memory,
+                    seed=seed,
+                    few_shot_num=few_shot_num,
+                    temp_dir=temp_dir,
+                    ttc_threshold_sec=ttc_threshold_sec,
+                    headway_threshold_m=headway_threshold_m,
+                    rear_ttc_threshold_sec=rear_ttc_threshold_sec,
+                    rear_headway_threshold_m=rear_headway_threshold_m,
+                    low_speed_blocking_threshold_mps=low_speed_blocking_threshold_mps,
+                    blocking_front_gap_safe_m=blocking_front_gap_safe_m,
+                    blocking_front_ttc_safe_sec=blocking_front_ttc_safe_sec,
+                    alignment_sample_rate=alignment_sample_rate,
+                    alignment_max_samples=alignment_max_samples,
+                    slow_decision_threshold_sec=slow_decision_threshold_sec,
+                    timeout_penalty_state=timeout_penalty_state,
+                    save_artifacts=save_run_artifacts,
+                    run_dir=model_run_dir,
+                    run_id=eval_run_id if save_run_artifacts else None,
+                    model_name=model_name,
+                    quiet_mode=step_log_quiet_mode,
+                    on_step=_on_step if progress is not None else None,
+                    on_decision=_on_decision if progress is not None else None,
+                )
+                episode_alignment_samples = episode_result.pop("alignment_samples", [])
+                for sample in episode_alignment_samples:
+                    sample["model"] = model_name
+                    model_alignment_samples.append(sample)
+                episodes.append(episode_result)
+                if save_run_artifacts and model_log_path:
+                    _append_eval_run_log(model_log_path, model_name, episode_result)
+                if progress is not None and seed_task is not None:
+                    progress.update(seed_task, advance=1)
+                status = "CRASH" if episode_result["crashed"] else ("ERROR" if episode_result["error"] else ("TIMEOUT" if episode_result.get("timeout_triggered") else "OK"))
+                emit(
+                    f"    -> {status} | steps={episode_result['steps']}/{episode_result['max_steps']} "
+                    f"| t={episode_result['episode_runtime_sec']}s | timeout_steps={episode_result.get('decision_timeout_count', 0)}"
+                )
+                if episode_result["error"]:
+                    emit(f"    -> [red]{episode_result['error']}[/red]")
+
+            report["model_runtime_policies"][model_name]["decision_timeout_penalty"] = (
+                decision_timeout_penalty_snapshot(timeout_penalty_state)
+            )
+            report["model_runtime_policies"][model_name]["native_timeout_penalty"] = (
+                decision_timeout_penalty_snapshot(timeout_penalty_state)
+            )
+            model_metrics_configs[model_name]["resolved_model_policy"] = dict(
+                report["model_runtime_policies"][model_name]
+            )
+            report["per_model"][model_name] = episodes
+            agg = aggregate_results(model_name, episodes)
+            report["aggregates"].append(agg)
+            aggregate_by_model[model_name] = agg
+            report["alignment_samples"].extend(model_alignment_samples[:alignment_max_samples] if alignment_max_samples > 0 else [])
+            if save_run_artifacts and model_run_dir:
+                run_metrics_report = _build_eval_run_metrics_report(
+                    model_name=model_name,
+                    experiment_id=experiment_id,
+                    experiment_root=experiment_root,
+                    run_id=eval_run_id,
+                    run_dir=model_run_dir,
+                    config_path=args.config,
+                    openai_api_type=str(config.get("OPENAI_API_TYPE", "")),
+                    few_shot_num=int(few_shot_num),
+                    memory_path=str(config.get("memory_path", "")),
+                    simulation_duration=int(config["simulation_duration"]),
+                    metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
+                    episodes=episodes,
+                    aggregate=agg,
+                )
+                run_metrics_path = timestamped_results_path("run_metrics", ext=".json", results_dir=model_run_dir)
+                write_json_atomic(run_metrics_path, run_metrics_report)
+                model_run_outputs[model_name] = {
+                    "run_id": eval_run_id,
+                    "run_dir": model_run_dir,
+                    "log_path": model_log_path,
+                    "run_metrics": run_metrics_path,
+                }
+
+            if progress is not None and model_task is not None:
+                progress.update(model_task, advance=1)
+            if progress is not None and seed_task is not None:
+                progress.remove_task(seed_task)
+            if progress is not None and step_task is not None:
+                progress.remove_task(step_task)
+
+    report["metrics_config"]["deprecated_policy_fields_ignored"] = sorted(
+        deprecated_policy_fields_ignored_union
+    )
     report["model_run_outputs"] = model_run_outputs
 
     user_out_path = None

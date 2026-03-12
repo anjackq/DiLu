@@ -1,13 +1,26 @@
+import argparse
+import atexit
 import copy
+from contextlib import nullcontext
 import random
 import numpy as np
 import yaml
 import os
 import json
 import re
+import sys
 import time
 from rich import print
 from rich.table import Table
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.markup import escape
 from typing import Optional
 
 import gymnasium as gym
@@ -19,6 +32,11 @@ from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.driver_agent.reflectionAgent import ReflectionAgent
 from dilu.runtime import (
     configure_runtime_env,
+    resolve_model_policy,
+    apply_model_policy_to_env,
+    build_decision_timeout_penalty_state,
+    update_decision_timeout_penalty_state,
+    decision_timeout_penalty_snapshot,
     build_highway_env_config,
     DEFAULT_DILU_SEEDS,
     ensure_dir,
@@ -54,6 +72,60 @@ def _to_bool(value, default=False):
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _resolve_progress_mode(config, cli_override: Optional[bool], mode: str = "runtime") -> bool:
+    if cli_override is not None:
+        return bool(cli_override)
+    global_default = _to_bool(config.get("progress_bar", True), default=True)
+    mode_key = "eval_progress_bar" if str(mode).strip().lower() == "eval" else "runtime_progress_bar"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _to_bool(mode_value, default=global_default)
+
+
+def _normalize_progress_reply_mode(value: Optional[str]) -> str:
+    mode = str(value or "off").strip().lower()
+    if mode in {"off", "compact", "full"}:
+        return mode
+    return "off"
+
+
+def _resolve_progress_reply_mode(config, cli_override: Optional[str], mode: str = "runtime") -> str:
+    if cli_override is not None:
+        return _normalize_progress_reply_mode(cli_override)
+    global_default = _normalize_progress_reply_mode(config.get("progress_reply_mode", "off"))
+    mode_key = "eval_progress_reply_mode" if str(mode).strip().lower() == "eval" else "runtime_progress_reply_mode"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _normalize_progress_reply_mode(mode_value)
+
+
+def _normalize_reply_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _compact_reply_preview(step_idx: int, action_id: int, response_text: str, max_len: int = 180) -> str:
+    normalized = _normalize_reply_text(response_text)
+    if not normalized:
+        normalized = "<empty>"
+    if len(normalized) > max_len:
+        normalized = normalized[: max_len - 3] + "..."
+    return f"[dim]      step={step_idx:02d} action={action_id} | {escape(normalized)}[/dim]"
+
+
+def _full_reply_preview(step_idx: int, action_id: int, response_text: str) -> str:
+    body = (response_text or "").strip() or "<empty>"
+    return f"[dim]      step={step_idx:02d} action={action_id}[/dim]\n{escape(body)}"
+
+
+def _is_interactive_output() -> bool:
+    try:
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        return False
 
 
 STRICT_RESPONSE_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*([0-4])\s*$", re.IGNORECASE)
@@ -147,6 +219,13 @@ def aggregate_run_results(episodes: list) -> dict:
     total_lane_change_rate = sum(float(e.get("lane_change_rate", 0.0)) for e in episodes)
     total_flap_rate = sum(float(e.get("flap_accel_decel_rate", 0.0)) for e in episodes)
     total_decision_latency_ms = sum(float(e.get("decision_latency_ms_avg", 0.0)) for e in episodes)
+    total_timeout_penalty_events = sum(int(e.get("timeout_penalty_events", 0)) for e in episodes)
+    timeout_penalty_stage_max_values = [int(e.get("timeout_penalty_stage_max", 0)) for e in episodes]
+    timeout_penalty_final_values = [
+        float(e.get("timeout_penalty_final_decision_timeout_sec"))
+        for e in episodes
+        if e.get("timeout_penalty_final_decision_timeout_sec") is not None
+    ]
 
     return {
         "episodes": total,
@@ -174,6 +253,22 @@ def aggregate_run_results(episodes: list) -> dict:
         "flap_accel_decel_rate_mean": round(total_flap_rate / total, 4) if total else None,
         "format_failure_rate_mean": round(total_format_failures / max(total_decisions, 1), 4),
         "decision_latency_ms_avg": round(total_decision_latency_ms / total, 3) if total else None,
+        "timeout_penalty_events_total": int(total_timeout_penalty_events),
+        "timeout_penalty_events_rate_mean": round(total_timeout_penalty_events / max(total_decisions, 1), 4),
+        "timeout_penalty_stage_max_mean": (
+            round(sum(timeout_penalty_stage_max_values) / max(total, 1), 4)
+            if total else None
+        ),
+        "timeout_penalty_stage_max_global": max(timeout_penalty_stage_max_values) if timeout_penalty_stage_max_values else 0,
+        "timeout_penalty_final_decision_timeout_sec_mean": (
+            round(sum(timeout_penalty_final_values) / len(timeout_penalty_final_values), 4)
+            if timeout_penalty_final_values else None
+        ),
+        # Deprecated alias for one transition cycle.
+        "timeout_penalty_final_native_timeout_sec_mean": (
+            round(sum(timeout_penalty_final_values) / len(timeout_penalty_final_values), 4)
+            if timeout_penalty_final_values else None
+        ),
     }
 
 
@@ -490,28 +585,99 @@ def print_ego_telemetry(step_idx: int, telemetry: dict):
     print(table)
 
 
-def setup_env(config):
-    selected_model = configure_runtime_env(config)
+def setup_env(config, quiet_override: Optional[bool] = None, progress_override: Optional[bool] = None):
+    selected_model = configure_runtime_env(
+        config,
+        mode="runtime",
+        quiet_override=quiet_override,
+        progress_override=progress_override,
+    )
     provider = str(config.get("OPENAI_API_TYPE", "")).strip().lower()
+    resolved_policy = resolve_model_policy(
+        config=config,
+        model_name=selected_model or "",
+        provider=provider,
+        mode="runtime",
+        cli_overrides=None,
+    )
+    apply_model_policy_to_env(resolved_policy, provider=provider)
+
+    policy_meta = dict(resolved_policy.get("policy_meta", {}))
+    source_parts = []
+    if policy_meta.get("matched_model_policy_override_key"):
+        source_parts.append(f"model_override={policy_meta['matched_model_policy_override_key']}")
+    if policy_meta.get("matched_eval_model_override_key"):
+        source_parts.append(f"legacy_eval_override={policy_meta['matched_eval_model_override_key']}")
+    source_label = " | ".join(source_parts) if source_parts else "base_defaults"
     if provider == 'ollama':
         print(f"[bold yellow]Configured for Local Ollama: {selected_model}[/bold yellow]")
     elif provider == "gemini":
         print(f"[bold yellow]Configured for Gemini API: {selected_model}[/bold yellow]")
+    print(
+        "[dim]Runtime policy (timeout-only): decision_timeout={timeout}s | source={source}[/dim]".format(
+            timeout=round(float(resolved_policy["decision_timeout_sec"]), 3),
+            source=source_label,
+        )
+    )
+    if policy_meta.get("deprecated_policy_fields_ignored"):
+        print(
+            "[yellow]Deprecated policy fields ignored (timeout-only policy):[/yellow] "
+            f"{', '.join(policy_meta['deprecated_policy_fields_ignored'])}"
+        )
 
     env_cfg = build_highway_env_config(
         config,
         show_trajectories=True,
         render_agent=True,
     )
-    return env_cfg, selected_model
+    return env_cfg, selected_model, resolved_policy
 
 
 if __name__ == '__main__':
     import warnings
     warnings.filterwarnings("ignore")
 
-    config = yaml.load(open('config.yaml'), Loader=yaml.FullLoader)
-    env_config, selected_model = setup_env(config)
+    parser = argparse.ArgumentParser(description="Run DiLu autonomous-driving simulation for a single configured model.")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--quiet", action="store_true", help="Suppress high-frequency step/decision logs.")
+    parser.add_argument("--no-quiet", action="store_true", help="Force step/decision logs on even if config quiet mode is enabled.")
+    parser.add_argument("--progress", action="store_true", help="Show CLI progress bars.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable CLI progress bars.")
+    parser.add_argument(
+        "--progress-replies",
+        choices=["off", "compact", "full"],
+        help="Show LLM replies while progress bars are active.",
+    )
+    args = parser.parse_args()
+    if args.quiet and args.no_quiet:
+        raise ValueError("Use only one of --quiet or --no-quiet.")
+    if args.progress and args.no_progress:
+        raise ValueError("Use only one of --progress or --no-progress.")
+
+    quiet_override = True if args.quiet else (False if args.no_quiet else None)
+    config_path = args.config
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    progress_override = True if args.progress else (False if args.no_progress else None)
+    resolved_runtime_progress_mode = _resolve_progress_mode(config, progress_override, mode="runtime")
+    runtime_progress_enabled = bool(resolved_runtime_progress_mode and _is_interactive_output())
+    env_config, selected_model, resolved_model_policy = setup_env(
+        config,
+        quiet_override=quiet_override,
+        progress_override=runtime_progress_enabled,
+    )
+    runtime_quiet_mode = _to_bool(os.getenv("DILU_QUIET_MODE"), default=False)
+    resolved_runtime_progress_reply_mode = _resolve_progress_reply_mode(
+        config,
+        args.progress_replies,
+        mode="runtime",
+    )
+    effective_runtime_progress_reply_mode = (
+        resolved_runtime_progress_reply_mode
+        if (runtime_progress_enabled and (not runtime_quiet_mode))
+        else "off"
+    )
+    step_log_quiet_mode = bool(runtime_quiet_mode or runtime_progress_enabled)
 
     REFLECTION = config["reflection_module"]
     reflection_interactive = _to_bool(config.get("reflection_interactive", True), default=True)
@@ -522,7 +688,6 @@ if __name__ == '__main__':
     memory_path = config["memory_path"]
     few_shot_num = config["few_shot_num"]
 
-    config_path = "config.yaml"
     results_root_cfg = str(config.get("results_root", "") or "").strip()
     experiment_id_cfg = str(config.get("experiment_id", "") or "").strip()
     run_id_cfg = str(config.get("run_id", "") or "").strip()
@@ -571,6 +736,32 @@ if __name__ == '__main__':
     ensure_dir(result_folder)
     ttc_threshold_sec = float(config.get("metrics_ttc_threshold_sec", 2.0))
     headway_threshold_m = float(config.get("metrics_headway_threshold_m", 15.0))
+    runtime_slow_decision_threshold_sec = float(
+        config.get(
+            "runtime_slow_decision_threshold_sec",
+            config.get("eval_slow_decision_threshold_sec", 5.0),
+        )
+    )
+    runtime_slow_decision_threshold_sec = max(0.001, runtime_slow_decision_threshold_sec)
+    provider = str(config.get("OPENAI_API_TYPE", "")).strip().lower()
+    timeout_penalty_state = build_decision_timeout_penalty_state(
+        config=config,
+        provider=provider,
+        mode="runtime",
+        baseline_decision_timeout_sec=float(resolved_model_policy["decision_timeout_sec"]),
+    )
+    initial_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+    print(
+        "[dim]Adaptive decision-timeout penalty: enabled={enabled}, baseline={baseline}s, floor={floor}s, "
+        "factor={factor}, trigger_consecutive_slow={trigger}, slow_threshold={threshold}s[/dim]".format(
+            enabled=bool(initial_penalty_snapshot.get("enabled")),
+            baseline=round(float(initial_penalty_snapshot.get("baseline_decision_timeout_sec") or 0.0), 3),
+            floor=round(float(initial_penalty_snapshot.get("min_timeout_sec") or 0.0), 3),
+            factor=round(float(initial_penalty_snapshot.get("halving_factor") or 0.0), 3),
+            trigger=int(initial_penalty_snapshot.get("trigger_consecutive_slow") or 0),
+            threshold=round(runtime_slow_decision_threshold_sec, 3),
+        )
+    )
 
     metrics_report = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -591,10 +782,31 @@ if __name__ == '__main__':
         "model_slug": model_slug,
         "run_id": run_id,
         "run_dir": result_folder,
+        "model_runtime_policy": copy.deepcopy(resolved_model_policy),
         "metrics_config": {
             "ttc_threshold_sec": ttc_threshold_sec,
             "headway_threshold_m": headway_threshold_m,
             "flapping_mode": "accel_decel",
+            "runtime_slow_decision_threshold_sec": round(runtime_slow_decision_threshold_sec, 3),
+            "decision_timeout_sec": round(float(resolved_model_policy["decision_timeout_sec"]), 3),
+            "adaptive_timeout_penalty_enabled": bool(config.get("adaptive_timeout_penalty_enabled", True)),
+            "adaptive_timeout_halving_factor": float(config.get("adaptive_timeout_halving_factor", 0.5)),
+            "adaptive_timeout_min_sec": float(config.get("adaptive_timeout_min_sec", 4.0)),
+            "adaptive_timeout_trigger_consecutive_slow": int(config.get("adaptive_timeout_trigger_consecutive_slow", 2)),
+            "quiet_mode": bool(runtime_quiet_mode),
+            "progress_bar": bool(runtime_progress_enabled),
+            "progress_bar_requested": bool(resolved_runtime_progress_mode),
+            "progress_reply_mode_requested": str(resolved_runtime_progress_reply_mode),
+            "progress_reply_mode_effective": str(effective_runtime_progress_reply_mode),
+            "policy_mode": "timeout_only",
+            "deprecated_policy_fields_ignored": resolved_model_policy.get("policy_meta", {}).get("deprecated_policy_fields_ignored", []),
+            "deprecated_metric_aliases": {
+                "timeout_penalty_final_native_timeout_sec": "timeout_penalty_final_decision_timeout_sec",
+                "timeout_penalty_final_native_timeout_sec_mean": "timeout_penalty_final_decision_timeout_sec_mean",
+            },
+            "decision_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
+            # Deprecated alias key for one transition cycle.
+            "native_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
         },
         "episodes": [],
         "aggregate": None,
@@ -609,14 +821,58 @@ if __name__ == '__main__':
         f.write("structured_results_mode {} | experiment_id {} | model_slug {} | run_id {} \n".format(
             structured_mode, experiment_id, model_slug, run_id
         ))
+        f.write(
+            "runtime_policy timeout_only decision_timeout={} \n".format(
+                round(float(resolved_model_policy["decision_timeout_sec"]), 3),
+            )
+        )
+        penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+        f.write(
+            "adaptive_decision_timeout_penalty enabled={} | baseline={} | floor={} | factor={} | trigger_consecutive_slow={} | slow_threshold={} \n".format(
+                bool(penalty_snapshot.get("enabled")),
+                round(float(penalty_snapshot.get("baseline_decision_timeout_sec") or 0.0), 3),
+                round(float(penalty_snapshot.get("min_timeout_sec") or 0.0), 3),
+                round(float(penalty_snapshot.get("halving_factor") or 0.0), 3),
+                int(penalty_snapshot.get("trigger_consecutive_slow") or 0),
+                round(runtime_slow_decision_threshold_sec, 3),
+            )
+        )
 
     agent_memory = DrivingMemory(db_path=memory_path)
     if REFLECTION:
         updated_memory = DrivingMemory(db_path=memory_path + "_updated")
         updated_memory.combineMemory(agent_memory)
 
+    progress = None
+    progress_stop_registered = False
+    episode_task = None
+    step_task = None
+    if runtime_progress_enabled:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=False,
+        )
+        progress.start()
+        atexit.register(progress.stop)
+        progress_stop_registered = True
+        episode_task = progress.add_task("Episodes", total=int(config["episodes_num"]))
+        step_task = progress.add_task("Steps", total=int(config["simulation_duration"]))
+    emit = progress.console.print if progress is not None else print
+
     episode = 0
     while episode < config["episodes_num"]:
+        if progress is not None and step_task is not None:
+            progress.update(
+                step_task,
+                description=f"Episode {episode + 1}/{int(config['episodes_num'])} steps",
+                total=int(config["simulation_duration"]),
+                completed=0,
+            )
         # setup highway-env
         envType = 'highway-v0'
         env = gym.make(envType, render_mode="rgb_array")
@@ -632,9 +888,15 @@ if __name__ == '__main__':
         # scenario and driver agent setting
         database_path = os.path.join(result_folder, f"{result_prefix}.db")
         sce = EnvScenario(env, envType, seed, database_path)
-        DA = DriverAgent(sce, verbose=True)
+        DA = DriverAgent(sce, verbose=not step_log_quiet_mode)
+        initial_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+        if initial_penalty_snapshot.get("enabled") and initial_penalty_snapshot.get("effective_decision_timeout_sec") is not None:
+            try:
+                DA.set_decision_timeout_sec(float(initial_penalty_snapshot["effective_decision_timeout_sec"]))
+            except Exception:
+                pass
         if REFLECTION:
-            RA = ReflectionAgent(verbose=True)
+            RA = ReflectionAgent(verbose=not step_log_quiet_mode)
 
         response = "Not available"
         action = "Not available"
@@ -648,6 +910,8 @@ if __name__ == '__main__':
         already_decision_steps = 0
 
         decisions_made = 0
+        penalty_start_events = int(timeout_penalty_state.get("penalty_events", 0))
+        timeout_penalty_stage_max = int(timeout_penalty_state.get("stage", 0))
         responses_with_delimiter = 0
         responses_strict_format = 0
         responses_direct_parseable = 0
@@ -665,7 +929,8 @@ if __name__ == '__main__':
             for i in range(0, config["simulation_duration"]):
                 obs = np.array(obs, dtype=float)
 
-                print("[cyan]Retreive similar memories...[/cyan]")
+                if not step_log_quiet_mode:
+                    print("[cyan]Retreive similar memories...[/cyan]")
                 fewshot_results = agent_memory.retriveMemory(
                     sce, i, few_shot_num) if few_shot_num > 0 else []
                 fewshot_messages = []
@@ -677,15 +942,18 @@ if __name__ == '__main__':
                     fewshot_answers.append(fewshot_result["LLM_response"])
                     fewshot_actions.append(fewshot_result["action"])
                 if few_shot_num == 0:
-                    print("[yellow]Now in the zero-shot mode, no few-shot memories.[/yellow]")
+                    if not step_log_quiet_mode:
+                        print("[yellow]Now in the zero-shot mode, no few-shot memories.[/yellow]")
                 else:
-                    print("[green4]Successfully find[/green4]", len(
-                        fewshot_actions), "[green4]similar memories![/green4]")
+                    if not step_log_quiet_mode:
+                        print("[green4]Successfully find[/green4]", len(
+                            fewshot_actions), "[green4]similar memories![/green4]")
 
                 sce_descrip = sce.describe(i)
                 avail_action = sce.availableActionsDescription()
-                print_ego_telemetry(i, get_ego_telemetry(sce))
-                print('[cyan]Scenario description: [/cyan]\n', sce_descrip)
+                if not step_log_quiet_mode:
+                    print_ego_telemetry(i, get_ego_telemetry(sce))
+                    print('[cyan]Scenario description: [/cyan]\n', sce_descrip)
                 # print('[cyan]Available actions: [/cyan]\n',avail_action)
                 action, response, human_question, fewshot_answer = DA.few_shot_decision(
                     scenario_description=sce_descrip, available_actions=avail_action,
@@ -695,6 +963,32 @@ if __name__ == '__main__':
                     fewshot_answers=fewshot_answers,
                 )
                 decisions_made += 1
+                decision_meta = getattr(DA, "last_decision_meta", {}) or {}
+                decision_timed_out = bool(decision_meta.get("timed_out", False))
+                decision_elapsed_sec = float(decision_meta.get("decision_elapsed_sec", 0.0) or 0.0)
+                penalty_update = update_decision_timeout_penalty_state(
+                    timeout_penalty_state,
+                    timed_out=decision_timed_out,
+                    decision_elapsed_sec=decision_elapsed_sec,
+                    slow_threshold_sec=runtime_slow_decision_threshold_sec,
+                )
+                timeout_penalty_stage_max = max(
+                    timeout_penalty_stage_max,
+                    int(penalty_update.get("stage", 0)),
+                )
+                if penalty_update.get("escalated"):
+                    effective_timeout = penalty_update.get("effective_decision_timeout_sec")
+                    if effective_timeout is not None:
+                        try:
+                            DA.set_decision_timeout_sec(float(effective_timeout))
+                        except Exception:
+                            pass
+                    if not step_log_quiet_mode:
+                        print(
+                            "[yellow]Adaptive timeout penalty escalated[/yellow] "
+                            f"(reason={penalty_update.get('reason')}, stage={penalty_update.get('stage')}, "
+                            f"decision_timeout={round(float(effective_timeout), 3) if effective_timeout is not None else 'n/a'}s)"
+                        )
                 fmt = _response_format_metrics(response)
                 responses_with_delimiter += int(fmt["has_delimiter"])
                 responses_strict_format += int(fmt["strict_format_match"])
@@ -712,6 +1006,10 @@ if __name__ == '__main__':
 
                 #obs, reward, done, info, _ = env.step(action)
                 action = _safe_int_action(action)
+                if effective_runtime_progress_reply_mode == "compact":
+                    emit(_compact_reply_preview(i + 1, action, response))
+                elif effective_runtime_progress_reply_mode == "full":
+                    emit(_full_reply_preview(i + 1, action, response))
                 lane_change_count += int(action in (0, 2))
                 if prev_action_id is not None and ((prev_action_id == 3 and action == 4) or (prev_action_id == 4 and action == 3)):
                     flap_accel_decel_count += 1
@@ -723,6 +1021,11 @@ if __name__ == '__main__':
 
                 already_decision_steps += 1
                 episode_reward_sum += float(reward)
+                if progress is not None and step_task is not None:
+                    progress.update(
+                        step_task,
+                        completed=min(already_decision_steps, int(config["simulation_duration"])),
+                    )
 
                 step_metrics = extract_step_traffic_metrics(env, ttc_threshold_sec, headway_threshold_m)
                 if step_metrics["ego_speed_mps"] is not None:
@@ -736,27 +1039,38 @@ if __name__ == '__main__':
                                   fewshot_answer, response)
                 #env.unwrapped.automatic_rendering_callback = env.video_recorder.capture_frame()
 
-                print("--------------------")
+                if not step_log_quiet_mode:
+                    print("--------------------")
 
                 if done:
-                    print(f"[red]Episode ended at step {i}. terminated={terminated}, truncated={truncated}, info={info}[/red]")
+                    emit(f"[red]Episode ended at step {i}. terminated={terminated}, truncated={truncated}, info={info}[/red]")
                     if crashed:
-                        print("[red]Simulation crash after running steps: [/red] ", i)
+                        emit(f"[red]Simulation crash after running steps:[/red] {i}")
                         collision_frame = i
                     else:
-                        print("[yellow]Episode ended without collision (e.g., timeout/truncation).[/yellow]")
+                        emit("[yellow]Episode ended without collision (e.g., timeout/truncation).[/yellow]")
                     break
         except Exception as exc:
             episode_error = f"{type(exc).__name__}: {exc}"
-            print(f"[red]Episode {episode} error: {episode_error}[/red]")
+            emit(f"[red]Episode {episode} error: {episode_error}[/red]")
         finally:
 
             with open(log_path, 'a') as f:
-                f.write("Simulation {} | Seed {} | Steps: {} | File prefix: {} \n".format(
-                    episode, seed, already_decision_steps, result_prefix))
+                current_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+                f.write(
+                    "Simulation {} | Seed {} | Steps: {} | File prefix: {} | penalty_stage={} | penalty_events={} | decision_timeout={} \n".format(
+                        episode,
+                        seed,
+                        already_decision_steps,
+                        result_prefix,
+                        int(current_penalty_snapshot.get("stage", 0) or 0),
+                        int(current_penalty_snapshot.get("penalty_events", 0) or 0),
+                        round(float(current_penalty_snapshot.get("effective_decision_timeout_sec") or 0.0), 3),
+                    )
+                )
                 
             if REFLECTION:
-                print("[yellow]Now running reflection agent...[/yellow]")
+                emit("[yellow]Now running reflection agent...[/yellow]")
                 if collision_frame != -1: # End with collision
                     for i in range(collision_frame, -1, -1):
                         if docs[i]["action"] != 4:  # not decelearate
@@ -779,10 +1093,10 @@ if __name__ == '__main__':
                                     docs[i]["sce"],
                                     comments="mistake-correction"
                                 )
-                                print("[green] Successfully add a new memory item to update memory module.[/green]. Now the database has ", len(
-                                    updated_memory.scenario_memory._collection.get(include=['embeddings'])['embeddings']), " items.")
+                                emit("[green] Successfully add a new memory item to update memory module.[/green]. Now the database has " + str(len(
+                                    updated_memory.scenario_memory._collection.get(include=['embeddings'])['embeddings'])) + " items.")
                             else:
-                                print("[blue]Ignore this new memory item[/blue]")
+                                emit("[blue]Ignore this new memory item[/blue]")
                             break
                 else:
                     planned_additions = len(docs) // reflection_add_every_n
@@ -806,10 +1120,10 @@ if __name__ == '__main__':
                                     comments="no-mistake-direct"
                                 )
                                 cnt +=1
-                        print("[green] Successfully add[/green] ",cnt," [green]new memory item to update memory module.[/green]. Now the database has ", len(
-                                    updated_memory.scenario_memory._collection.get(include=['embeddings'])['embeddings']), " items.")
+                        emit("[green] Successfully add[/green] " + str(cnt) + " [green]new memory item to update memory module.[/green]. Now the database has " + str(len(
+                                    updated_memory.scenario_memory._collection.get(include=['embeddings'])['embeddings'])) + " items.")
                     else:
-                        print("[blue]Ignore these new memory items[/blue]")
+                        emit("[blue]Ignore these new memory items[/blue]")
 
             duration_sec = time.time() - episode_started
             episode_reward_avg = episode_reward_sum / max(already_decision_steps, 1)
@@ -820,6 +1134,11 @@ if __name__ == '__main__':
             flap_accel_decel_rate = flap_accel_decel_count / max(already_decision_steps, 1)
             decision_latency_ms_avg = (duration_sec / max(already_decision_steps, 1)) * 1000.0
             format_failure_rate = format_failure_count / max(decisions_made, 1)
+            penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+            timeout_penalty_events = max(
+                0,
+                int(penalty_snapshot.get("penalty_events", 0)) - penalty_start_events,
+            )
 
             metrics_report["episodes"].append({
                 "episode_index": int(episode),
@@ -853,10 +1172,25 @@ if __name__ == '__main__':
                 "flap_accel_decel_count": int(flap_accel_decel_count),
                 "flap_accel_decel_rate": round(flap_accel_decel_rate, 4),
                 "decision_latency_ms_avg": round(decision_latency_ms_avg, 3),
+                "timeout_penalty_stage_max": int(timeout_penalty_stage_max),
+                "timeout_penalty_events": int(timeout_penalty_events),
+                "timeout_penalty_final_decision_timeout_sec": (
+                    round(float(penalty_snapshot.get("effective_decision_timeout_sec")), 4)
+                    if penalty_snapshot.get("effective_decision_timeout_sec") is not None
+                    else None
+                ),
+                # Deprecated alias for one transition cycle.
+                "timeout_penalty_final_native_timeout_sec": (
+                    round(float(penalty_snapshot.get("effective_decision_timeout_sec")), 4)
+                    if penalty_snapshot.get("effective_decision_timeout_sec") is not None
+                    else None
+                ),
                 "error": episode_error,
             })
 
-            print("==========Simulation {} Done==========".format(episode))
+            emit("==========Simulation {} Done==========".format(episode))
+            if progress is not None and episode_task is not None:
+                progress.update(episode_task, advance=1)
             episode += 1
 
             try:
@@ -864,6 +1198,25 @@ if __name__ == '__main__':
             except Exception:
                 pass
 
+    if progress is not None:
+        try:
+            if step_task is not None:
+                progress.remove_task(step_task)
+            if episode_task is not None:
+                progress.remove_task(episode_task)
+        finally:
+            progress.stop()
+            if progress_stop_registered:
+                try:
+                    atexit.unregister(progress.stop)
+                except Exception:
+                    pass
+
+    final_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+    metrics_report["model_runtime_policy"]["decision_timeout_penalty"] = copy.deepcopy(final_penalty_snapshot)
+    metrics_report["model_runtime_policy"]["native_timeout_penalty"] = copy.deepcopy(final_penalty_snapshot)
+    metrics_report["metrics_config"]["decision_timeout_penalty"] = copy.deepcopy(final_penalty_snapshot)
+    metrics_report["metrics_config"]["native_timeout_penalty"] = copy.deepcopy(final_penalty_snapshot)
     metrics_report["aggregate"] = aggregate_run_results(metrics_report["episodes"])
     metrics_report_path = timestamped_results_path("run_metrics", ext=".json", results_dir=result_folder)
     write_json_atomic(metrics_report_path, metrics_report)

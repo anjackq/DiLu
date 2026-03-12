@@ -21,7 +21,62 @@ def _pick_model(config: Dict[str, Any], api_type: str, chat_model_override: Opti
     return model_str
 
 
-def configure_runtime_env(config: Dict[str, Any], chat_model_override: Optional[str] = None) -> Optional[str]:
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_output_runtime_controls(config: Dict[str, Any]) -> None:
+    """
+    Runtime output controls are configured here (outside policy resolution).
+    """
+    disable_streaming = _as_bool(config.get("eval_disable_streaming", True), default=True)
+    disable_checker = _as_bool(config.get("eval_disable_checker_llm", True), default=True)
+    try:
+        max_output_tokens = int(config.get("eval_decision_max_output_tokens", 512))
+    except Exception:
+        max_output_tokens = 512
+    max_output_tokens = max(1, max_output_tokens)
+
+    os.environ["DILU_USE_STREAMING"] = "0" if disable_streaming else "1"
+    os.environ["DILU_ENABLE_CHECKER_LLM"] = "0" if disable_checker else "1"
+    os.environ["DILU_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+
+
+def _resolve_quiet_mode(config: Dict[str, Any], mode: str, quiet_override: Optional[bool]) -> bool:
+    if quiet_override is not None:
+        return bool(quiet_override)
+    mode_normalized = str(mode or "runtime").strip().lower()
+    global_default = _as_bool(config.get("quiet_mode", False), default=False)
+    mode_key = "eval_quiet_mode" if mode_normalized == "eval" else "runtime_quiet_mode"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _as_bool(mode_value, default=global_default)
+
+
+def _resolve_progress_bar(config: Dict[str, Any], mode: str, progress_override: Optional[bool]) -> bool:
+    if progress_override is not None:
+        return bool(progress_override)
+    mode_normalized = str(mode or "runtime").strip().lower()
+    global_default = _as_bool(config.get("progress_bar", True), default=True)
+    mode_key = "eval_progress_bar" if mode_normalized == "eval" else "runtime_progress_bar"
+    mode_value = config.get(mode_key)
+    if mode_value is None:
+        return global_default
+    return _as_bool(mode_value, default=global_default)
+
+
+def configure_runtime_env(
+    config: Dict[str, Any],
+    chat_model_override: Optional[str] = None,
+    mode: str = "runtime",
+    quiet_override: Optional[bool] = None,
+    progress_override: Optional[bool] = None,
+) -> Optional[str]:
     """
     Configure provider-specific env vars used by DiLu runtime scripts.
 
@@ -29,6 +84,9 @@ def configure_runtime_env(config: Dict[str, Any], chat_model_override: Optional[
     """
     api_type = str(config["OPENAI_API_TYPE"]).strip().lower()
     selected_model = _pick_model(config, api_type, chat_model_override)
+    _apply_output_runtime_controls(config)
+    os.environ["DILU_QUIET_MODE"] = "1" if _resolve_quiet_mode(config, mode, quiet_override) else "0"
+    os.environ["DILU_PROGRESS_BAR"] = "1" if _resolve_progress_bar(config, mode, progress_override) else "0"
 
     if api_type == "azure":
         os.environ["OPENAI_API_TYPE"] = "azure"

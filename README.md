@@ -45,7 +45,7 @@ python evaluate_models_ollama.py --help
 ### 1) Smoke test (fast sanity check)
 
 ```bash
-python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 0 --experiment-id smoke_test
+python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 0 --experiment-id smoke_test --quiet --progress
 ```
 
 ### 2) Multi-model benchmark
@@ -54,17 +54,46 @@ python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 
 python evaluate_models_ollama.py --models llama3.2:1b llama3.2:3b qwen3.5:0.8b qwen3.5:2b deepseek-r1:1.5b --limit 5 --few-shot-num 0 --experiment-id tier1_lightweight_base_instruct
 ```
 
-### 3) Timeout-guarded run (for slow thinking models)
+### 3) Progress bars + compact LLM reply previews
 
 ```bash
-python evaluate_models_ollama.py --models qwen3.5:0.8b qwen3.5:2b --limit 3 --few-shot-num 0 --experiment-id qwen_timeout_guard --ollama-think-mode no_think --decision-timeout-sec 10 --disable-streaming --disable-checker-llm
+python evaluate_models_ollama.py --models qwen3.5:0.8b --limit 1 --few-shot-num 0 --experiment-id smoke_with_replies --progress --progress-replies compact
 ```
+
+### 4) Timeout-guarded run (timeout-only policy)
+
+```bash
+python evaluate_models_ollama.py --models qwen3.5:0.8b qwen3.5:2b --limit 3 --few-shot-num 0 --experiment-id qwen_timeout_guard --decision-timeout-sec 10
+```
+
+Timeout-only policy (shared for eval + runtime):
+- Policy controls only `decision_timeout_sec` and adaptive timeout penalty.
+- Use `model_policy_overrides` (or legacy `eval_model_overrides`) with `decision_timeout_sec` entries.
+- Output-affecting policy fields (`max tokens`, `streaming`, `checker`, `think/native`) are deprecated and ignored with warnings.
+- Decision timeout can auto-shrink on slow/timeout decisions via:
+  `adaptive_timeout_penalty_enabled`, `adaptive_timeout_halving_factor`,
+  `adaptive_timeout_min_sec`, `adaptive_timeout_trigger_consecutive_slow`.
 
 Optional single-model interactive runner:
 
 ```bash
-python run_dilu_ollama.py
+python run_dilu_ollama.py --progress --progress-replies compact
 ```
+
+Quiet mode notes:
+- `--quiet` suppresses high-frequency step/decision logs only.
+- Warnings/errors, run progress, and final summaries are still printed.
+- Config defaults: `quiet_mode`, `eval_quiet_mode`, `runtime_quiet_mode`.
+
+Progress bar notes:
+- Nested bars are enabled by default on interactive terminals.
+- Eval bars: model -> seed -> step.
+- Runtime bars: episode -> step.
+- CLI overrides: `--progress` / `--no-progress`.
+- Config defaults: `progress_bar`, `eval_progress_bar`, `runtime_progress_bar`.
+- Reply previews with bars: `--progress-replies off|compact|full`.
+- Quiet mode wins: with `--quiet`, reply previews are forced off.
+- Config defaults: `progress_reply_mode`, `eval_progress_reply_mode`, `runtime_progress_reply_mode`.
 
 Default structured outputs are written under:
 
@@ -137,9 +166,9 @@ python plot_eval_compare.py -i results/tier1_lightweight_base_instruct/compare/e
 ## Troubleshooting (Short)
 
 - Long waits on Qwen small models:
-  - Use `--ollama-think-mode no_think`
   - Lower timeout (for example `--decision-timeout-sec 8` or `10`)
-  - Use `--disable-streaming --disable-checker-llm`
+  - Enable adaptive timeout penalty in config (`adaptive_timeout_*` keys)
+  - If you still need output behavior changes, configure them outside policy mode.
 - `Native Ollama chat failed ... Falling back to OpenAI-compatible path`:
   - Usually native `/api/chat` timeout or model-specific incompatibility.
   - Keep `OLLAMA_USE_NATIVE_CHAT: true` and tune timeout/think mode per model.
