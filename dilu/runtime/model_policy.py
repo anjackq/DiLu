@@ -1,6 +1,6 @@
 import fnmatch
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 POLICY_TIMEOUT_FIELDS = ("decision_timeout_sec",)
@@ -12,6 +12,9 @@ DEPRECATED_POLICY_FIELDS = (
     "ollama_use_native_chat",
     "ollama_native_chat_timeout_sec",
 )
+EVAL_TIMEOUT_POLICY_MODE_DEFAULT = "laddered"
+EVAL_TIMEOUT_LADDER_SEC_DEFAULT = [15.0, 20.0, 30.0]
+EVAL_TIMEOUT_RECOVERY_SUCCESSES_DEFAULT = 3
 
 
 def _clamp_float(value: Any, default: float, minimum: float) -> float:
@@ -36,6 +39,31 @@ def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_eval_timeout_policy_mode(value: Any) -> str:
+    text = str(value or EVAL_TIMEOUT_POLICY_MODE_DEFAULT).strip().lower()
+    return "legacy" if text in {"legacy", "adaptive", "shrink_only"} else "laddered"
+
+
+def _normalize_timeout_ladder(value: Any) -> List[float]:
+    raw = value if value is not None else EVAL_TIMEOUT_LADDER_SEC_DEFAULT
+    if isinstance(raw, str):
+        tokens = [token.strip() for token in raw.split(",") if token.strip()]
+        values = [float(token) for token in tokens]
+    else:
+        values = [float(item) for item in list(raw)]
+    if not values:
+        values = list(EVAL_TIMEOUT_LADDER_SEC_DEFAULT)
+    deduped: List[float] = []
+    for item in values:
+        item = max(1.0, float(item))
+        if not deduped or float(item) != float(deduped[-1]):
+            deduped.append(float(item))
+    deduped = sorted(deduped)
+    if len(deduped) < 2:
+        deduped = list(EVAL_TIMEOUT_LADDER_SEC_DEFAULT)
+    return deduped
 
 
 def _normalize_provider(provider: Any) -> str:
@@ -174,6 +202,40 @@ def build_decision_timeout_penalty_state(
 ) -> Dict[str, Any]:
     norm_provider = _normalize_provider(provider)
     norm_mode = str(mode or "eval").strip().lower()
+    policy_mode = (
+        _normalize_eval_timeout_policy_mode(config.get("eval_timeout_policy_mode"))
+        if norm_mode == "eval"
+        else "legacy"
+    )
+    if norm_mode == "eval" and policy_mode == "laddered":
+        ladder = _normalize_timeout_ladder(config.get("eval_timeout_ladder_sec"))
+        recovery_successes = _clamp_int(
+            config.get("eval_timeout_recovery_successes", EVAL_TIMEOUT_RECOVERY_SUCCESSES_DEFAULT),
+            default=EVAL_TIMEOUT_RECOVERY_SUCCESSES_DEFAULT,
+            minimum=1,
+        )
+        initial_timeout_sec = float(ladder[0])
+        return {
+            "enabled": True,
+            "provider": norm_provider,
+            "mode": norm_mode,
+            "policy_mode": "laddered",
+            "baseline_decision_timeout_sec": initial_timeout_sec,
+            "effective_decision_timeout_sec": initial_timeout_sec,
+            "min_timeout_sec": initial_timeout_sec,
+            "halving_factor": None,
+            "trigger_consecutive_slow": None,
+            "slow_threshold_sec": None,
+            "stage": 0,
+            "timeout_ladder_sec": list(ladder),
+            "current_level_index": 0,
+            "recovery_successes_required": int(recovery_successes),
+            "recovery_success_streak": 0,
+            "penalty_events": 0,
+            "timeout_triggers": 0,
+            "slow_triggers": 0,
+        }
+
     enabled = _as_bool(config.get("adaptive_timeout_penalty_enabled"), default=True)
 
     halving_factor = _clamp_float(
@@ -213,6 +275,7 @@ def build_decision_timeout_penalty_state(
         "enabled": bool(enabled),
         "provider": norm_provider,
         "mode": norm_mode,
+        "policy_mode": "legacy",
         "baseline_decision_timeout_sec": baseline_timeout_sec,
         "effective_decision_timeout_sec": baseline_timeout_sec,
         "min_timeout_sec": min_timeout_sec,
@@ -258,6 +321,56 @@ def update_decision_timeout_penalty_state(
             "stage": 0 if not isinstance(state, dict) else int(state.get("stage", 0) or 0),
             "effective_decision_timeout_sec": effective,
             "consecutive_slow_count": 0 if not isinstance(state, dict) else int(state.get("consecutive_slow_count", 0) or 0),
+            "policy_mode": None if not isinstance(state, dict) else state.get("policy_mode"),
+            "recovered": False,
+        }
+
+    if state.get("policy_mode") == "laddered":
+        ladder = _normalize_timeout_ladder(state.get("timeout_ladder_sec"))
+        current_idx = _clamp_int(state.get("current_level_index", 0), default=0, minimum=0)
+        current_idx = min(current_idx, len(ladder) - 1)
+        recovery_required = _clamp_int(
+            state.get("recovery_successes_required", EVAL_TIMEOUT_RECOVERY_SUCCESSES_DEFAULT),
+            default=EVAL_TIMEOUT_RECOVERY_SUCCESSES_DEFAULT,
+            minimum=1,
+        )
+        escalated = False
+        recovered = False
+        reason = None
+
+        if bool(timed_out):
+            state["timeout_triggers"] = _clamp_int(state.get("timeout_triggers", 0), default=0, minimum=0) + 1
+            state["recovery_success_streak"] = 0
+            next_idx = min(current_idx + 1, len(ladder) - 1)
+            if next_idx > current_idx:
+                current_idx = next_idx
+                escalated = True
+                reason = "timeout"
+                state["penalty_events"] = _clamp_int(state.get("penalty_events", 0), default=0, minimum=0) + 1
+        else:
+            state["recovery_success_streak"] = _clamp_int(
+                state.get("recovery_success_streak", 0), default=0, minimum=0
+            ) + 1
+            if current_idx > 0 and int(state["recovery_success_streak"]) >= recovery_required:
+                current_idx -= 1
+                recovered = True
+                reason = "recovery"
+                state["recovery_success_streak"] = 0
+
+        state["current_level_index"] = int(current_idx)
+        state["stage"] = int(current_idx)
+        state["effective_decision_timeout_sec"] = float(ladder[current_idx])
+        state["baseline_decision_timeout_sec"] = float(ladder[0])
+        state["min_timeout_sec"] = float(ladder[0])
+        state["timeout_ladder_sec"] = list(ladder)
+        return {
+            "escalated": escalated,
+            "recovered": recovered,
+            "reason": reason,
+            "stage": int(state["stage"]),
+            "effective_decision_timeout_sec": float(state["effective_decision_timeout_sec"]),
+            "consecutive_slow_count": 0,
+            "policy_mode": "laddered",
         }
 
     threshold = _clamp_float(
@@ -291,10 +404,12 @@ def update_decision_timeout_penalty_state(
     state["effective_decision_timeout_sec"] = _effective_timeout_from_stage(state)
     return {
         "escalated": bool(reason is not None),
+        "recovered": False,
         "reason": reason,
         "stage": int(state["stage"]),
         "effective_decision_timeout_sec": float(state["effective_decision_timeout_sec"]),
         "consecutive_slow_count": int(state["consecutive_slow_count"]),
+        "policy_mode": "legacy",
     }
 
 
@@ -302,6 +417,7 @@ def decision_timeout_penalty_snapshot(state: Optional[Dict[str, Any]]) -> Dict[s
     if not isinstance(state, dict):
         return {
             "enabled": False,
+            "policy_mode": None,
             "stage": 0,
             "penalty_events": 0,
             "timeout_triggers": 0,
@@ -312,12 +428,17 @@ def decision_timeout_penalty_snapshot(state: Optional[Dict[str, Any]]) -> Dict[s
             "halving_factor": None,
             "trigger_consecutive_slow": None,
             "slow_threshold_sec": None,
+            "timeout_ladder_sec": None,
+            "current_level_index": None,
+            "recovery_successes_required": None,
+            "recovery_success_streak": None,
             # Compatibility aliases (deprecated)
             "baseline_native_timeout_sec": None,
             "effective_native_timeout_sec": None,
         }
     return {
         "enabled": bool(state.get("enabled", False)),
+        "policy_mode": state.get("policy_mode"),
         "stage": int(state.get("stage", 0) or 0),
         "penalty_events": int(state.get("penalty_events", 0) or 0),
         "timeout_triggers": int(state.get("timeout_triggers", 0) or 0),
@@ -336,6 +457,26 @@ def decision_timeout_penalty_snapshot(state: Optional[Dict[str, Any]]) -> Dict[s
         "halving_factor": float(state["halving_factor"]) if state.get("halving_factor") is not None else None,
         "trigger_consecutive_slow": int(state["trigger_consecutive_slow"]) if state.get("trigger_consecutive_slow") is not None else None,
         "slow_threshold_sec": float(state["slow_threshold_sec"]) if state.get("slow_threshold_sec") is not None else None,
+        "timeout_ladder_sec": (
+            [float(value) for value in state.get("timeout_ladder_sec", [])]
+            if state.get("timeout_ladder_sec") is not None
+            else None
+        ),
+        "current_level_index": (
+            int(state["current_level_index"])
+            if state.get("current_level_index") is not None
+            else None
+        ),
+        "recovery_successes_required": (
+            int(state["recovery_successes_required"])
+            if state.get("recovery_successes_required") is not None
+            else None
+        ),
+        "recovery_success_streak": (
+            int(state["recovery_success_streak"])
+            if state.get("recovery_success_streak") is not None
+            else None
+        ),
         # Compatibility aliases (deprecated)
         "baseline_native_timeout_sec": (
             float(state["baseline_decision_timeout_sec"])

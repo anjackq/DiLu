@@ -261,6 +261,12 @@ Run only training on an existing cleaned dataset:
 python fine_tuning/run_pipeline.py --train --clean-output data/gold_standard_data_clean.jsonl
 ```
 
+Run train + GGUF + Ollama create for Qwen 3 8B on the RL-clean dataset:
+
+```bash
+python fine_tuning/run_pipeline.py --train --gguf --config config.yaml --clean-output data/gold_standard_data_rl_5000eps_clean.jsonl --model-name Qwen/Qwen3-8B --model-family auto --merged-model-dir fine_tuning/merged_models/dilu-qwen3-8b-v1 --gguf-name dilu-qwen3-8b-v1 --gguf-outtype f16 --gguf-create-ollama --ollama-model dilu-qwen3-8b-v1
+```
+
 ## Notes
 
 - `config.yaml` controls simulation settings used during data collection.

@@ -5,16 +5,16 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import gymnasium as gym
 import numpy as np
 import requests
-import yaml
 from gymnasium.wrappers import RecordVideo
 from rich.progress import (
     BarColumn,
@@ -31,6 +31,7 @@ from dilu.driver_agent.driverAgent import DriverAgent
 from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.runtime import (
     configure_runtime_env,
+    load_runtime_config,
     resolve_model_policy,
     apply_model_policy_to_env,
     build_decision_timeout_penalty_state,
@@ -55,18 +56,34 @@ from dilu.runtime import (
     benchmark_max_steps,
     build_benchmark_instruction,
     benchmark_metric_config,
+    validate_benchmark_case_set,
+    summarize_benchmark_episodes,
+    benchmark_result_validity,
     BenchmarkEpisodeEvaluator,
+    augment_behavior_aware_benchmark_episode,
+    TOKEN_COUNT_METHOD,
+    load_idle_calibration,
+    save_idle_calibration,
+    enrich_episode_energy_metrics,
+    summarize_energy_latency_episodes,
+    create_energy_monitor,
+    system_hardware_snapshot,
+    build_energy_tradeoff_summary,
+    aggregate_episode_token_usage,
 )
 from dilu.scenario.envScenario import EnvScenario
 
 
 STRICT_RESPONSE_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*([0-4])\s*$", re.IGNORECASE)
+STOP_THRESHOLD_MPS_DEFAULT = 0.5
+NEAR_STOP_THRESHOLD_MPS_DEFAULT = 2.0
 
 
 def build_env_bundle(
     config: Dict,
     env_id_override: Optional[str] = None,
     native_env_defaults_override: Optional[bool] = None,
+    action_target_speeds_override: Optional[str] = None,
 ) -> Dict:
     return resolve_simulation_env_bundle(
         config,
@@ -74,6 +91,7 @@ def build_env_bundle(
         render_agent=False,
         env_id_override=env_id_override,
         native_env_defaults_override=native_env_defaults_override,
+        action_target_speeds_override=action_target_speeds_override,
     )
 
 
@@ -88,6 +106,398 @@ def parse_seeds(raw: Optional[str]) -> List[int]:
     if not seeds:
         raise ValueError("No valid seeds provided.")
     return seeds
+
+
+def parse_action_target_speeds(raw: Optional[str]) -> Optional[str]:
+    text = str(raw or "").strip()
+    return text or None
+
+
+def _clamp_int(value: Any, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
+
+
+def _clamp_float(value: Any, default: float, minimum: float = 0.0, maximum: Optional[float] = None) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
+    result = max(float(minimum), result)
+    if maximum is not None:
+        result = min(float(maximum), result)
+    return result
+
+
+def _normalize_on_off(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "on":
+        return True
+    if text == "off":
+        return False
+    raise ValueError(f"Unsupported on/off value: {value}")
+
+
+def _resolve_eval_timeout_early_stop_policy(config: Dict, args) -> Dict[str, Any]:
+    enabled_override = _normalize_on_off(getattr(args, "timeout_early_stop", None))
+    require_max_level_override = _normalize_on_off(getattr(args, "timeout_early_stop_require_max_level", None))
+    enabled = (
+        enabled_override
+        if enabled_override is not None
+        else _config_as_bool(config.get("eval_timeout_early_stop_enabled", True), default=True)
+    )
+    return {
+        "enabled": bool(enabled),
+        "min_decisions": _clamp_int(
+            getattr(args, "timeout_early_stop_min_decisions", None)
+            if getattr(args, "timeout_early_stop_min_decisions", None) is not None
+            else config.get("eval_timeout_early_stop_min_decisions", 5),
+            default=5,
+            minimum=1,
+        ),
+        "consecutive_timeout_fallbacks": _clamp_int(
+            getattr(args, "timeout_early_stop_consecutive", None)
+            if getattr(args, "timeout_early_stop_consecutive", None) is not None
+            else config.get("eval_timeout_early_stop_consecutive_timeout_fallbacks", 3),
+            default=3,
+            minimum=1,
+        ),
+        "collapse_rate_threshold": _clamp_float(
+            getattr(args, "timeout_early_stop_rate", None)
+            if getattr(args, "timeout_early_stop_rate", None) is not None
+            else config.get("eval_timeout_early_stop_collapse_rate_threshold", 0.8),
+            default=0.8,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        "require_max_timeout_level": (
+            require_max_level_override
+            if require_max_level_override is not None
+            else _config_as_bool(config.get("eval_timeout_early_stop_require_max_timeout_level", True), default=True)
+        ),
+        "quarantine_after_collapses": _clamp_int(
+            getattr(args, "timeout_collapse_quarantine_after", None)
+            if getattr(args, "timeout_collapse_quarantine_after", None) is not None
+            else config.get("eval_timeout_model_quarantine_after_collapses", 2),
+            default=2,
+            minimum=1,
+        ),
+    }
+
+
+def _should_early_stop_timeout_episode(
+    *,
+    decision_calls_total: int,
+    decision_timeout_count: int,
+    fallback_action_count: int,
+    consecutive_timeout_fallbacks: int,
+    timeout_policy_mode: Optional[str],
+    active_timeout_level: Optional[float],
+    max_timeout_level: Optional[float],
+    policy: Optional[Dict[str, Any]],
+) -> Tuple[bool, Optional[str]]:
+    policy = dict(policy or {})
+    if not policy.get("enabled", False):
+        return False, None
+    if int(decision_calls_total) < int(policy.get("min_decisions", 1) or 1):
+        return False, None
+    if (
+        str(timeout_policy_mode or "").strip().lower() == "laddered"
+        and bool(policy.get("require_max_timeout_level", False))
+    ):
+        if active_timeout_level is None or max_timeout_level is None:
+            return False, None
+        if float(active_timeout_level) + 1e-9 < float(max_timeout_level):
+            return False, None
+    if int(consecutive_timeout_fallbacks) >= int(policy.get("consecutive_timeout_fallbacks", 1) or 1):
+        return True, "consecutive_timeout_fallback_collapse"
+    timeout_rate = float(decision_timeout_count) / max(int(decision_calls_total), 1)
+    fallback_rate = float(fallback_action_count) / max(int(decision_calls_total), 1)
+    threshold = float(policy.get("collapse_rate_threshold", 1.0) or 1.0)
+    if timeout_rate >= threshold and fallback_rate >= threshold:
+        return True, "rate_timeout_fallback_collapse"
+    return False, None
+
+
+def _summarize_decision_latency_samples(decision_latencies_sec: List[float]) -> Dict[str, Optional[float]]:
+    samples = [max(0.0, float(value)) for value in decision_latencies_sec if value is not None]
+    if not samples:
+        return {
+            "decision_latency_ms_avg": None,
+            "p95_decision_latency_sec": None,
+        }
+    return {
+        "decision_latency_ms_avg": round((sum(samples) / len(samples)) * 1000.0, 3),
+        "p95_decision_latency_sec": round(float(np.percentile(np.array(samples, dtype=float), 95)), 4),
+    }
+
+
+def _index_ollama_preflight_results(preflight_results: List[Dict]) -> Dict[str, Dict]:
+    indexed: Dict[str, Dict] = {}
+    for item in preflight_results or []:
+        if not isinstance(item, dict):
+            continue
+        model_name = str(item.get("model") or "").strip()
+        if model_name:
+            indexed[model_name] = copy.deepcopy(item)
+    return indexed
+
+
+def _annotate_aggregate_with_ollama_preflight_status(
+    aggregate: Dict,
+    preflight_results_by_model: Dict[str, Dict],
+) -> Dict:
+    annotated = dict(aggregate)
+    probe = preflight_results_by_model.get(str(aggregate.get("model") or "").strip())
+    annotated["ollama_preflight_ok"] = None if probe is None else bool(probe.get("ok"))
+    annotated["ollama_preflight_transport"] = None if probe is None else probe.get("transport")
+    annotated["ollama_preflight_elapsed_sec"] = None if probe is None else probe.get("elapsed_sec")
+    annotated["ollama_preflight_error"] = None if probe is None else probe.get("error")
+    return annotated
+
+
+def _extend_invalid_reason(existing: Optional[str], *extras: Optional[str]) -> Optional[str]:
+    parts = [str(existing).strip()] if existing else []
+    for item in extras:
+        text = str(item or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "; ".join(parts) if parts else None
+
+
+def _build_measurement_integrity_summary(
+    preflight_results: List[Dict],
+    preflight_warning: Optional[str],
+    skipped_models_due_to_preflight: Optional[List[Dict[str, Any]]] = None,
+    quarantined_models_due_to_timeout_collapse: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, List]:
+    failed_models = []
+    for item in preflight_results or []:
+        if not isinstance(item, dict) or bool(item.get("ok")):
+            continue
+        failed_models.append(
+            {
+                "model": item.get("model"),
+                "transport": item.get("transport"),
+                "elapsed_sec": item.get("elapsed_sec"),
+                "timeout_sec": item.get("timeout_sec"),
+                "error": item.get("error"),
+            }
+        )
+    warnings = [str(preflight_warning)] if preflight_warning else []
+    return {
+        "measurement_integrity_warnings": warnings,
+        "ollama_preflight_failed_models": failed_models,
+        "skipped_models_due_to_preflight": list(skipped_models_due_to_preflight or []),
+        "quarantined_models_due_to_timeout_collapse": list(quarantined_models_due_to_timeout_collapse or []),
+    }
+
+
+def _build_skipped_model_aggregate(
+    *,
+    model_name: str,
+    planned_episode_count: int,
+    reason: str,
+    preflight_probe: Optional[Dict[str, Any]] = None,
+    benchmark_mode: bool = False,
+) -> Dict[str, Any]:
+    aggregate = {
+        "model": model_name,
+        "episodes": 0,
+        "planned_episode_count": int(max(0, planned_episode_count)),
+        "executed_episode_count": 0,
+        "skipped_episode_count": int(max(0, planned_episode_count)),
+        "episode_execution_complete": False,
+        "model_skipped_due_to_preflight": True,
+        "model_skipped_reason": str(reason),
+        "model_quarantined_due_to_timeout_collapse": False,
+        "model_quarantine_reason": None,
+        "episodes_stopped_by_timeout_cap": 0,
+        "crash_rate": None,
+        "no_collision_rate": None,
+        "error_rate": None,
+        "avg_steps": None,
+        "avg_episode_runtime_sec": None,
+        "avg_step_runtime_sec": None,
+        "decision_timeout_rate_mean": None,
+        "timeout_episode_rate": None,
+        "fallback_action_rate_mean": None,
+        "decision_latency_ms_avg": None,
+        "timeout_collapse_detected": False,
+        "timeout_collapse_reason": None,
+        "ollama_preflight_ok": None if preflight_probe is None else bool(preflight_probe.get("ok")),
+        "ollama_preflight_transport": None if preflight_probe is None else preflight_probe.get("transport"),
+        "ollama_preflight_elapsed_sec": None if preflight_probe is None else preflight_probe.get("elapsed_sec"),
+        "ollama_preflight_error": None if preflight_probe is None else preflight_probe.get("error"),
+    }
+    if benchmark_mode:
+        aggregate.update(
+            {
+                "task_completion_rate": None,
+                "overall_score_mean": None,
+                "driving_score": None,
+                "benchmark_result_valid": False,
+                "benchmark_result_invalid_reason": _extend_invalid_reason(
+                    None,
+                    "incomplete_episode_set",
+                    str(reason),
+                ),
+            }
+        )
+    return aggregate
+
+
+def _normalize_energy_mode(raw: Optional[str]) -> str:
+    mode = str(raw or "none").strip().lower()
+    if mode == "none":
+        return "none"
+    if mode in {"latency_only", "joulescope_hw"}:
+        return mode
+    return "none"
+
+
+def _apply_measurement_runtime_overrides(
+    config: Dict,
+    args,
+    *,
+    energy_mode: str,
+) -> Dict:
+    runtime_config = copy.deepcopy(config)
+    if _normalize_energy_mode(energy_mode) == "none":
+        return runtime_config
+    if str(runtime_config.get("OPENAI_API_TYPE", "")).strip().lower() != "ollama":
+        return runtime_config
+
+    think_override = getattr(args, "ollama_think_mode", None)
+    use_native_flag = bool(getattr(args, "ollama_use_native_chat", False))
+    disable_native_flag = bool(getattr(args, "ollama_disable_native_chat", False))
+    if use_native_flag and disable_native_flag:
+        raise ValueError(
+            "Use only one of --ollama-use-native-chat or --ollama-disable-native-chat/--no-ollama-use-native-chat."
+        )
+
+    native_chat_override = None
+    if use_native_flag:
+        native_chat_override = True
+    elif disable_native_flag:
+        native_chat_override = False
+
+    auto_forced_native = False
+    if think_override is not None:
+        runtime_config["OLLAMA_THINK_MODE"] = str(think_override)
+        if native_chat_override is None:
+            runtime_config["OLLAMA_USE_NATIVE_CHAT"] = True
+            auto_forced_native = True
+        else:
+            runtime_config["OLLAMA_USE_NATIVE_CHAT"] = bool(native_chat_override)
+    elif native_chat_override is not None:
+        runtime_config["OLLAMA_USE_NATIVE_CHAT"] = bool(native_chat_override)
+
+    runtime_config["_benchmark_ollama_runtime_overrides"] = {
+        "ollama_think_mode": runtime_config.get("OLLAMA_THINK_MODE"),
+        "ollama_use_native_chat": runtime_config.get("OLLAMA_USE_NATIVE_CHAT"),
+        "auto_forced_native_chat": bool(auto_forced_native),
+    }
+    return runtime_config
+
+
+def _inspect_ollama_model(model_name: str) -> Dict[str, Optional[str]]:
+    try:
+        proc = subprocess.run(
+            ["ollama", "show", model_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return {
+            "model_tag": model_name,
+            "available": None,
+            "family": None,
+            "quantization": None,
+            "parameters": None,
+        }
+
+    text = (proc.stdout or proc.stderr or "").strip()
+    result = {
+        "model_tag": model_name,
+        "available": proc.returncode == 0,
+        "family": None,
+        "quantization": None,
+        "parameters": None,
+    }
+    for line in text.splitlines():
+        lower = line.lower()
+        if "family" in lower and result["family"] is None:
+            result["family"] = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+        elif "quantization" in lower and result["quantization"] is None:
+            result["quantization"] = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+        elif "parameter" in lower and result["parameters"] is None:
+            result["parameters"] = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+    return result
+
+
+def _measurement_record(episode: Dict) -> Dict:
+    return {
+        "episode_id": str(episode.get("case_id") or f"seed_{episode.get('seed')}"),
+        "seed": episode.get("seed"),
+        "case_id": episode.get("case_id"),
+        "category": episode.get("category"),
+        "episode_wall_time_start": episode.get("episode_wall_time_start"),
+        "episode_wall_time_end": episode.get("episode_wall_time_end"),
+        "episode_runtime_sec": episode.get("episode_runtime_sec"),
+        "energy_mode": episode.get("energy_mode"),
+        "raw_energy_j": episode.get("raw_energy_j"),
+        "idle_baseline_energy_j": episode.get("idle_baseline_energy_j"),
+        "net_energy_j": episode.get("net_energy_j"),
+        "avg_power_w": episode.get("avg_power_w"),
+        "peak_power_w": episode.get("peak_power_w"),
+        "energy_per_decision_j": episode.get("energy_per_decision_j"),
+        "energy_per_token_j": episode.get("energy_per_token_j"),
+        "prompt_tokens_total": episode.get("prompt_tokens_total"),
+        "completion_tokens_total": episode.get("completion_tokens_total"),
+        "total_tokens": episode.get("total_tokens"),
+        "tokens_generated_total": episode.get("tokens_generated_total"),
+        "tokens_per_second": episode.get("tokens_per_second"),
+        "latency_to_first_action_sec": episode.get("latency_to_first_action_sec"),
+        "token_count_method": episode.get("token_count_method"),
+        "token_usage_source": episode.get("token_usage_source"),
+        "energy_measurement_meta": episode.get("energy_measurement_meta"),
+    }
+
+
+def _action_histogram(action_trace: List[Dict]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in action_trace:
+        key = str(int(item.get("action_id", -1)))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _resolve_measurement_output_root(
+    *,
+    args,
+    experiment_id: str,
+) -> str:
+    if args.output_root:
+        return ensure_dir(args.output_root)
+    results_root = args.results_root or os.path.join("results", "energy_benchmarks")
+    return ensure_dir(os.path.join(results_root, experiment_id))
+
+
+def _calibration_output_path(
+    *,
+    args,
+    output_root: str,
+) -> str:
+    if args.calibration_output:
+        return args.calibration_output
+    return os.path.join(output_root, "calibration", f"idle_power_{current_timestamp()}.json")
 
 
 def _normalize_performance_mode(value: Optional[str]) -> str:
@@ -111,6 +521,17 @@ def _config_as_bool(value, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_simulation_duration(
+    config: Dict,
+    env_config_snapshot: Optional[Dict[str, Any]] = None,
+) -> int:
+    if config.get("simulation_duration") is not None:
+        return int(config["simulation_duration"])
+    if env_config_snapshot is not None and env_config_snapshot.get("duration") is not None:
+        return int(env_config_snapshot["duration"])
+    return 30
+
+
 def _resolve_eval_ollama_preflight_enabled(config: Dict, cli_skip: bool) -> bool:
     if cli_skip:
         return False
@@ -123,6 +544,70 @@ def _resolve_eval_ollama_preflight_timeout_sec(config: Dict, cli_override: Optio
     else:
         timeout_sec = float(config.get("eval_ollama_preflight_timeout_sec", 15.0))
     return max(1.0, timeout_sec)
+
+
+def _normalize_measurement_hard_preflight_policy(value: Optional[str]) -> str:
+    text = str(value or "skip_model").strip().lower()
+    if text in {"warn_run", "skip_model", "abort_run"}:
+        return text
+    return "skip_model"
+
+
+def _resolve_measurement_hard_preflight_policy(config: Dict, args) -> str:
+    if getattr(args, "strict_ollama_preflight", False):
+        return "abort_run"
+    cli_value = getattr(args, "measurement_hard_preflight_policy", None)
+    if cli_value is not None:
+        return _normalize_measurement_hard_preflight_policy(cli_value)
+    return _normalize_measurement_hard_preflight_policy(
+        config.get("eval_measurement_hard_preflight_policy", "skip_model")
+    )
+
+
+def _classify_ollama_preflight_failure(result: Dict[str, Any]) -> str:
+    status_code = result.get("status_code")
+    if isinstance(status_code, int):
+        if 400 <= status_code < 500:
+            return "hard"
+        return "soft"
+    error_text = str(result.get("error") or "").strip().lower()
+    hard_markers = [
+        "404",
+        "400",
+        "401",
+        "403",
+        "422",
+        "not found",
+        "unsupported",
+        "invalid request",
+        "bad request",
+        "model not found",
+    ]
+    return "hard" if any(marker in error_text for marker in hard_markers) else "soft"
+
+
+def _format_ollama_preflight_failures(failures: List[Dict[str, Any]]) -> str:
+    if not failures:
+        return ""
+    lines = [
+        "Ollama preflight failed before evaluation.",
+        "The backend did not respond to a tiny test completion, so the eval could not be trusted as-is.",
+    ]
+    for item in failures:
+        lines.append(
+            f"- model={item['model']} transport={item['transport']} "
+            f"timeout={item['timeout_sec']}s error={item['error']}"
+        )
+    lines.extend(
+        [
+            "Recommended checks:",
+            "1. Restart Ollama and ensure no models are stuck in 'Stopping...'.",
+            "2. Run `ollama run <model> \"Reply with exactly 4\"` manually.",
+            "3. Reduce GPU contention or unload stale Ollama model processes.",
+            "4. Use `--skip-ollama-preflight` only if you intentionally want to wait through long model calls.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _ollama_native_chat_url(api_base: str) -> str:
@@ -228,6 +713,9 @@ def _run_ollama_preflight(
                     f"| elapsed={probe['elapsed_sec']}s | preview={escape(preview)}"
                 )
         except Exception as exc:
+            status_code = None
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                status_code = exc.response.status_code
             failure = {
                 "model": model_name,
                 "ok": False,
@@ -238,29 +726,10 @@ def _run_ollama_preflight(
                 ),
                 "timeout_sec": float(timeout_sec),
                 "error": f"{type(exc).__name__}: {exc}",
+                "status_code": status_code,
             }
             results.append(failure)
             failures.append(failure)
-    if failures:
-        lines = [
-            "Ollama preflight failed before evaluation.",
-            "The backend did not respond to a tiny test completion, so the eval was aborted early.",
-        ]
-        for item in failures:
-            lines.append(
-                f"- model={item['model']} transport={item['transport']} "
-                f"timeout={item['timeout_sec']}s error={item['error']}"
-            )
-        lines.extend(
-            [
-                "Recommended checks:",
-                "1. Restart Ollama and ensure no models are stuck in 'Stopping...'.",
-                "2. Run `ollama run <model> \"Reply with exactly 4\"` manually.",
-                "3. Reduce GPU contention or unload stale Ollama model processes.",
-                "4. Use `--skip-ollama-preflight` only if you intentionally want to wait through long model calls.",
-            ]
-        )
-        raise RuntimeError("\n".join(lines))
     return results
 
 
@@ -398,6 +867,8 @@ def extract_step_traffic_metrics(
     low_speed_blocking_threshold_mps: float,
     blocking_front_gap_safe_m: float,
     blocking_front_ttc_safe_sec: float,
+    stop_threshold_mps: float,
+    near_stop_threshold_mps: float,
 ) -> Dict:
     ego_speed_mps = None
     front_gap_m = None
@@ -411,6 +882,8 @@ def extract_step_traffic_metrics(
     rear_ttc_danger = False
     rear_headway_violation = False
     low_speed_blocking = False
+    stopped = False
+    near_stop = False
 
     try:
         uenv = env.unwrapped
@@ -418,6 +891,8 @@ def extract_step_traffic_metrics(
         road = getattr(uenv, "road", None)
         if ego is not None:
             ego_speed_mps = float(getattr(ego, "speed", 0.0))
+            stopped = bool(ego_speed_mps <= stop_threshold_mps)
+            near_stop = bool(ego_speed_mps <= near_stop_threshold_mps)
         if ego is not None and road is not None:
             front_vehicle, rear_vehicle = road.neighbour_vehicles(ego, ego.lane_index)
             if front_vehicle is not None:
@@ -459,6 +934,8 @@ def extract_step_traffic_metrics(
         "rear_ttc_danger": rear_ttc_danger,
         "rear_headway_violation": rear_headway_violation,
         "low_speed_blocking": low_speed_blocking,
+        "stopped": stopped,
+        "near_stop": near_stop,
     }
 
 
@@ -477,6 +954,8 @@ def run_episode(
     low_speed_blocking_threshold_mps: float,
     blocking_front_gap_safe_m: float,
     blocking_front_ttc_safe_sec: float,
+    stop_threshold_mps: float,
+    near_stop_threshold_mps: float,
     alignment_sample_rate: float,
     alignment_max_samples: int,
     slow_decision_threshold_sec: float,
@@ -492,6 +971,7 @@ def run_episode(
     benchmark_case: Optional[Dict] = None,
     driving_instruction: Optional[str] = None,
     max_steps_override: Optional[int] = None,
+    timeout_early_stop_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     env = None
     if benchmark_case is not None:
@@ -499,7 +979,10 @@ def run_episode(
         result_prefix = f"{case_slug}_seed_{seed}"
     else:
         result_prefix = f"highway_seed_{seed}"
-    episode_max_steps = int(max_steps_override or config["simulation_duration"])
+    env_snapshot = None
+    if isinstance(env_config, dict):
+        env_snapshot = env_config.get(env_type) if isinstance(env_config.get(env_type), dict) else None
+    episode_max_steps = int(max_steps_override or _resolve_simulation_duration(config, env_snapshot))
     if save_artifacts:
         if not run_dir:
             raise ValueError("run_dir is required when save_artifacts is enabled.")
@@ -541,6 +1024,9 @@ def run_episode(
     rear_ttc_danger_steps = 0
     rear_headway_violation_steps = 0
     low_speed_blocking_steps = 0
+    min_ego_speed_mps = None
+    stop_steps = 0
+    near_stop_steps = 0
     lane_change_count = 0
     flap_accel_decel_count = 0
     prev_action_id = None
@@ -567,6 +1053,17 @@ def run_episode(
         if isinstance(timeout_penalty_state, dict)
         else 0
     )
+    timeout_policy_mode = None
+    timeout_level_initial_sec = None
+    timeout_level_final_sec = None
+    timeout_level_max_sec = None
+    timeout_escalation_count = 0
+    timeout_recovery_count = 0
+    timeout_level_counts = {15.0: 0, 20.0: 0, 30.0: 0}
+    timeout_early_stop_triggered = False
+    timeout_early_stop_reason = None
+    timeout_early_stop_step = None
+    consecutive_timeout_fallbacks = 0
     benchmark_evaluator: Optional[BenchmarkEpisodeEvaluator] = None
 
     try:
@@ -592,6 +1089,14 @@ def run_episode(
             benchmark_evaluator = BenchmarkEpisodeEvaluator(benchmark_case, env)
             episode_max_steps = int(max_steps_override or benchmark_evaluator.max_steps)
         initial_penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+        timeout_policy_mode = initial_penalty_snapshot.get("policy_mode")
+        timeout_level_initial_sec = initial_penalty_snapshot.get("effective_decision_timeout_sec")
+        timeout_level_final_sec = timeout_level_initial_sec
+        timeout_level_max_sec = timeout_level_initial_sec
+        timeout_level_cap_sec = None
+        ladder_levels = initial_penalty_snapshot.get("timeout_ladder_sec") or []
+        if ladder_levels:
+            timeout_level_cap_sec = max(float(value) for value in ladder_levels)
         if initial_penalty_snapshot.get("enabled") and initial_penalty_snapshot.get("effective_decision_timeout_sec") is not None:
             try:
                 agent.set_decision_timeout_sec(
@@ -623,6 +1128,17 @@ def run_episode(
                 fewshot_answers=fewshot_answers,
             )
             prev_action = action
+            level_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
+            active_timeout_level = level_snapshot.get("effective_decision_timeout_sec")
+            if active_timeout_level is not None:
+                active_timeout_level = float(active_timeout_level)
+                if active_timeout_level in timeout_level_counts:
+                    timeout_level_counts[active_timeout_level] += 1
+                timeout_level_max_sec = (
+                    active_timeout_level
+                    if timeout_level_max_sec is None
+                    else max(float(timeout_level_max_sec), active_timeout_level)
+                )
             decision_calls_total += 1
             decisions_made += 1
             decision_meta = getattr(agent, "last_decision_meta", {}) or {}
@@ -639,6 +1155,11 @@ def run_episode(
             decision_elapsed_sec = float(decision_meta.get("decision_elapsed_sec", 0.0) or 0.0)
             decision_timeout_count += int(timed_out)
             fallback_action_count += int(used_fallback)
+            consecutive_timeout_fallbacks = (
+                consecutive_timeout_fallbacks + 1
+                if (timed_out and used_fallback)
+                else 0
+            )
             ollama_native_retry_count += int(ollama_native_retry_used)
             ollama_openai_fallback_count += int(ollama_transport == "openai_compat_fallback")
             ollama_native_decision_count += int(ollama_transport == "native")
@@ -653,17 +1174,28 @@ def run_episode(
                 slow_threshold_sec=slow_decision_threshold_sec,
             )
             timeout_penalty_stage_max = max(timeout_penalty_stage_max, int(penalty_update.get("stage", 0)))
-            if penalty_update.get("escalated"):
+            if penalty_update.get("escalated") or penalty_update.get("recovered"):
                 effective_decision_timeout_sec = penalty_update.get("effective_decision_timeout_sec")
                 if effective_decision_timeout_sec is not None:
                     try:
                         agent.set_decision_timeout_sec(float(effective_decision_timeout_sec))
                     except Exception:
                         pass
+            if penalty_update.get("escalated"):
+                timeout_escalation_count += 1
                 if not quiet_mode:
                     print(
-                        "[yellow]Adaptive timeout penalty escalated[/yellow] "
+                        "[yellow]Eval timeout policy escalated[/yellow] "
                         f"(reason={penalty_update.get('reason')}, stage={penalty_update.get('stage')}, "
+                        f"decision_timeout={round(float(effective_decision_timeout_sec), 3) if effective_decision_timeout_sec is not None else 'n/a'}s)"
+                    )
+            if penalty_update.get("recovered"):
+                timeout_recovery_count += 1
+                if not quiet_mode:
+                    effective_decision_timeout_sec = penalty_update.get("effective_decision_timeout_sec")
+                    print(
+                        "[green]Eval timeout policy recovered[/green] "
+                        f"(stage={penalty_update.get('stage')}, "
                         f"decision_timeout={round(float(effective_decision_timeout_sec), 3) if effective_decision_timeout_sec is not None else 'n/a'}s)"
                     )
             if ollama_effective_mode:
@@ -718,15 +1250,23 @@ def run_episode(
                 low_speed_blocking_threshold_mps,
                 blocking_front_gap_safe_m,
                 blocking_front_ttc_safe_sec,
+                stop_threshold_mps,
+                near_stop_threshold_mps,
             )
             if step_metrics["ego_speed_mps"] is not None:
                 ego_speed_sum += float(step_metrics["ego_speed_mps"])
                 ego_speed_count += 1
+                if min_ego_speed_mps is None:
+                    min_ego_speed_mps = float(step_metrics["ego_speed_mps"])
+                else:
+                    min_ego_speed_mps = min(min_ego_speed_mps, float(step_metrics["ego_speed_mps"]))
             ttc_danger_steps += int(step_metrics["ttc_danger"])
             headway_violation_steps += int(step_metrics["headway_violation"])
             rear_ttc_danger_steps += int(step_metrics["rear_ttc_danger"])
             rear_headway_violation_steps += int(step_metrics["rear_headway_violation"])
             low_speed_blocking_steps += int(step_metrics["low_speed_blocking"])
+            stop_steps += int(step_metrics["stopped"])
+            near_stop_steps += int(step_metrics["near_stop"])
             if benchmark_evaluator is not None:
                 benchmark_evaluator.update(
                     env,
@@ -742,6 +1282,31 @@ def run_episode(
                     pass
 
             if done:
+                break
+
+            should_early_stop, early_stop_reason = _should_early_stop_timeout_episode(
+                decision_calls_total=decision_calls_total,
+                decision_timeout_count=decision_timeout_count,
+                fallback_action_count=fallback_action_count,
+                consecutive_timeout_fallbacks=consecutive_timeout_fallbacks,
+                timeout_policy_mode=timeout_policy_mode,
+                active_timeout_level=penalty_update.get("effective_decision_timeout_sec"),
+                max_timeout_level=timeout_level_cap_sec,
+                policy=timeout_early_stop_policy,
+            )
+            if should_early_stop and not crashed:
+                timeout_early_stop_triggered = True
+                timeout_early_stop_reason = str(early_stop_reason)
+                timeout_early_stop_step = int(steps)
+                truncated = True
+                episode_stop_reason = "episode_timeout_cap"
+                if not quiet_mode:
+                    print(
+                        "[yellow]Timeout early-stop triggered[/yellow] "
+                        f"(reason={timeout_early_stop_reason}, step={timeout_early_stop_step}, "
+                        f"decision_timeouts={decision_timeout_count}/{decision_calls_total}, "
+                        f"fallbacks={fallback_action_count}/{decision_calls_total})"
+                    )
                 break
 
     except Exception as exc:
@@ -767,15 +1332,18 @@ def run_episode(
     rear_ttc_danger_rate = rear_ttc_danger_steps / max(steps, 1)
     rear_headway_violation_rate = rear_headway_violation_steps / max(steps, 1)
     low_speed_blocking_rate = low_speed_blocking_steps / max(steps, 1)
+    stop_rate = stop_steps / max(steps, 1)
+    near_stop_rate = near_stop_steps / max(steps, 1)
     lane_change_rate = lane_change_count / max(steps, 1)
     flap_accel_decel_rate = flap_accel_decel_count / max(steps, 1)
-    decision_latency_ms_avg = (duration_sec / max(steps, 1)) * 1000.0
     format_failure_rate = format_failure_count / max(decisions_made, 1)
     decision_timeout_rate = decision_timeout_count / max(decision_calls_total, 1)
     fallback_action_rate = fallback_action_count / max(decision_calls_total, 1)
     ollama_native_retry_rate = ollama_native_retry_count / max(decision_calls_total, 1)
     ollama_openai_fallback_rate = ollama_openai_fallback_count / max(decision_calls_total, 1)
-    p95_decision_latency_sec = float(np.percentile(decision_latencies_sec, 95)) if decision_latencies_sec else 0.0
+    latency_stats = _summarize_decision_latency_samples(decision_latencies_sec)
+    decision_latency_ms_avg = latency_stats["decision_latency_ms_avg"]
+    p95_decision_latency_sec = latency_stats["p95_decision_latency_sec"]
     timeout_triggered = decision_timeout_count > 0
     penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
     timeout_penalty_events = (
@@ -793,9 +1361,21 @@ def run_episode(
         if penalty_snapshot.get("enabled")
         else 0
     )
+    timeout_level_final_sec = penalty_snapshot.get("effective_decision_timeout_sec")
+    if timeout_level_final_sec is not None:
+        timeout_level_final_sec = float(timeout_level_final_sec)
+    if timeout_level_initial_sec is not None:
+        timeout_level_initial_sec = float(timeout_level_initial_sec)
+    if timeout_level_max_sec is not None:
+        timeout_level_max_sec = float(timeout_level_max_sec)
+    timeout_level_15_rate = timeout_level_counts[15.0] / max(decision_calls_total, 1)
+    timeout_level_20_rate = timeout_level_counts[20.0] / max(decision_calls_total, 1)
+    timeout_level_30_rate = timeout_level_counts[30.0] / max(decision_calls_total, 1)
 
     if episode_stop_reason != "error":
-        if crashed:
+        if episode_stop_reason == "episode_timeout_cap":
+            pass
+        elif crashed:
             episode_stop_reason = "crash"
         elif truncated:
             episode_stop_reason = "truncated"
@@ -838,7 +1418,7 @@ def run_episode(
     else:
         benchmark_metrics = {}
 
-    return {
+    episode_result = {
         "seed": seed,
         "steps": steps,
         "max_steps": int(episode_max_steps),
@@ -850,6 +1430,9 @@ def run_episode(
         "avg_step_runtime_sec": round(duration_sec / max(steps, 1), 3),
         "episode_stop_reason": episode_stop_reason,
         "timeout_triggered": bool(timeout_triggered),
+        "timeout_early_stop_triggered": bool(timeout_early_stop_triggered),
+        "timeout_early_stop_reason": timeout_early_stop_reason,
+        "timeout_early_stop_step": timeout_early_stop_step,
         "first_timeout_step": first_timeout_step,
         "decision_calls_total": decision_calls_total,
         "decision_timeout_count": decision_timeout_count,
@@ -867,7 +1450,7 @@ def run_episode(
         "ollama_native_timeout_short_circuit_count": ollama_native_timeout_short_circuit_count,
         "ollama_downgrade_triggered": bool(ollama_native_retry_count > 0 or ("auto" in ollama_effective_think_modes_seen and ollama_requested_think_mode == "think")),
         "slow_decision_count": int(slow_decision_count),
-        "p95_decision_latency_sec": round(p95_decision_latency_sec, 4),
+        "p95_decision_latency_sec": p95_decision_latency_sec,
         "timeout_penalty_stage_max": int(timeout_penalty_stage_max),
         "timeout_penalty_events": int(max(0, timeout_penalty_events)),
         "timeout_penalty_timeout_triggers": int(max(0, timeout_penalty_timeout_triggers)),
@@ -877,6 +1460,15 @@ def run_episode(
             if penalty_snapshot.get("effective_decision_timeout_sec") is not None
             else None
         ),
+        "timeout_policy_mode": timeout_policy_mode,
+        "timeout_level_initial_sec": round(float(timeout_level_initial_sec), 4) if timeout_level_initial_sec is not None else None,
+        "timeout_level_final_sec": round(float(timeout_level_final_sec), 4) if timeout_level_final_sec is not None else None,
+        "timeout_level_max_sec": round(float(timeout_level_max_sec), 4) if timeout_level_max_sec is not None else None,
+        "timeout_escalation_count": int(timeout_escalation_count),
+        "timeout_recovery_count": int(timeout_recovery_count),
+        "timeout_level_15_rate": round(timeout_level_15_rate, 4),
+        "timeout_level_20_rate": round(timeout_level_20_rate, 4),
+        "timeout_level_30_rate": round(timeout_level_30_rate, 4),
         # Deprecated alias for one transition cycle.
         "timeout_penalty_final_native_timeout_sec": (
             round(float(penalty_snapshot.get("effective_decision_timeout_sec")), 4)
@@ -902,11 +1494,17 @@ def run_episode(
         "rear_headway_violation_rate": round(rear_headway_violation_rate, 4),
         "low_speed_blocking_steps": low_speed_blocking_steps,
         "low_speed_blocking_rate": round(low_speed_blocking_rate, 4),
+        "min_ego_speed_mps": round(float(min_ego_speed_mps), 4) if min_ego_speed_mps is not None else None,
+        "stopped_ever": bool(stop_steps > 0),
+        "stop_steps": int(stop_steps),
+        "stop_rate": round(stop_rate, 4),
+        "near_stop_steps": int(near_stop_steps),
+        "near_stop_rate": round(near_stop_rate, 4),
         "lane_change_count": lane_change_count,
         "lane_change_rate": round(lane_change_rate, 4),
         "flap_accel_decel_count": flap_accel_decel_count,
         "flap_accel_decel_rate": round(flap_accel_decel_rate, 4),
-        "decision_latency_ms_avg": round(decision_latency_ms_avg, 3),
+        "decision_latency_ms_avg": decision_latency_ms_avg,
         "alignment_samples": alignment_samples,
         "model": model_name,
         "database_path": database_path if save_artifacts else None,
@@ -917,10 +1515,25 @@ def run_episode(
         "final_info": copy.deepcopy(final_info),
         **benchmark_metrics,
     }
+    if benchmark_case is not None:
+        return augment_behavior_aware_benchmark_episode(episode_result)
+    return episode_result
 
 
-def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
+def aggregate_results(
+    model_name: str,
+    episodes: List[Dict],
+    *,
+    planned_episode_count: Optional[int] = None,
+    model_quarantined_due_to_timeout_collapse: bool = False,
+    model_quarantine_reason: Optional[str] = None,
+    model_skipped_due_to_preflight: bool = False,
+    model_skipped_reason: Optional[str] = None,
+) -> Dict:
     total = len(episodes)
+    planned_total = max(total, int(planned_episode_count if planned_episode_count is not None else total))
+    skipped_episode_count = max(0, planned_total - total)
+    episode_execution_complete = skipped_episode_count == 0 and not bool(model_skipped_due_to_preflight)
     crashes = sum(1 for e in episodes if e["crashed"])
     errors = sum(1 for e in episodes if e["error"])
     no_collision = sum(1 for e in episodes if e["success_no_collision"])
@@ -954,9 +1567,22 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     total_rear_ttc_danger_rate = sum(float(e.get("rear_ttc_danger_rate", 0.0)) for e in episodes)
     total_rear_headway_rate = sum(float(e.get("rear_headway_violation_rate", 0.0)) for e in episodes)
     total_low_speed_blocking_rate = sum(float(e.get("low_speed_blocking_rate", 0.0)) for e in episodes)
+    total_stop_rate = sum(float(e.get("stop_rate", 0.0)) for e in episodes)
+    total_near_stop_rate = sum(float(e.get("near_stop_rate", 0.0)) for e in episodes)
     total_lane_change_rate = sum(float(e.get("lane_change_rate", 0.0)) for e in episodes)
     total_flap_rate = sum(float(e.get("flap_accel_decel_rate", 0.0)) for e in episodes)
-    total_decision_latency_ms = sum(float(e.get("decision_latency_ms_avg", 0.0)) for e in episodes)
+    decision_latency_ms_values = [
+        float(e.get("decision_latency_ms_avg"))
+        for e in episodes
+        if e.get("decision_latency_ms_avg") is not None
+    ]
+    min_ego_speed_values = [
+        float(e.get("min_ego_speed_mps"))
+        for e in episodes
+        if e.get("min_ego_speed_mps") is not None
+    ]
+    stop_episode_count = sum(1 for e in episodes if e.get("stopped_ever"))
+    near_stop_episode_count = sum(1 for e in episodes if float(e.get("near_stop_rate", 0.0) or 0.0) > 0.0)
     total_timeout_penalty_events = sum(int(e.get("timeout_penalty_events", 0)) for e in episodes)
     total_timeout_penalty_timeout_triggers = sum(
         int(e.get("timeout_penalty_timeout_triggers", 0)) for e in episodes
@@ -964,11 +1590,21 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     total_timeout_penalty_slow_triggers = sum(
         int(e.get("timeout_penalty_slow_triggers", 0)) for e in episodes
     )
+    total_timeout_escalation_count = sum(int(e.get("timeout_escalation_count", 0)) for e in episodes)
+    total_timeout_recovery_count = sum(int(e.get("timeout_recovery_count", 0)) for e in episodes)
+    total_timeout_level_15_rate = sum(float(e.get("timeout_level_15_rate", 0.0)) for e in episodes)
+    total_timeout_level_20_rate = sum(float(e.get("timeout_level_20_rate", 0.0)) for e in episodes)
+    total_timeout_level_30_rate = sum(float(e.get("timeout_level_30_rate", 0.0)) for e in episodes)
     timeout_penalty_stage_max_values = [int(e.get("timeout_penalty_stage_max", 0)) for e in episodes]
     timeout_penalty_final_values = [
         float(e.get("timeout_penalty_final_decision_timeout_sec"))
         for e in episodes
         if e.get("timeout_penalty_final_decision_timeout_sec") is not None
+    ]
+    timeout_level_max_values = [
+        float(e.get("timeout_level_max_sec"))
+        for e in episodes
+        if e.get("timeout_level_max_sec") is not None
     ]
     decision_timeout_rate_mean = round(total_decision_timeouts / max(total_decision_calls, 1), 4)
     fallback_action_rate_mean = round(total_fallback_actions / max(total_decision_calls, 1), 4)
@@ -988,6 +1624,14 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
     aggregate = {
         "model": model_name,
         "episodes": total,
+        "planned_episode_count": planned_total,
+        "executed_episode_count": total,
+        "skipped_episode_count": skipped_episode_count,
+        "episode_execution_complete": bool(episode_execution_complete),
+        "model_skipped_due_to_preflight": bool(model_skipped_due_to_preflight),
+        "model_skipped_reason": model_skipped_reason,
+        "model_quarantined_due_to_timeout_collapse": bool(model_quarantined_due_to_timeout_collapse),
+        "model_quarantine_reason": model_quarantine_reason,
         "crashes": crashes,
         "errors": errors,
         "no_collision_episodes": no_collision,
@@ -1032,10 +1676,18 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
         "rear_ttc_danger_rate_mean": round(total_rear_ttc_danger_rate / total, 4) if total else None,
         "rear_headway_violation_rate_mean": round(total_rear_headway_rate / total, 4) if total else None,
         "low_speed_blocking_rate_mean": round(total_low_speed_blocking_rate / total, 4) if total else None,
+        "min_ego_speed_mps_mean": round(sum(min_ego_speed_values) / len(min_ego_speed_values), 4) if min_ego_speed_values else None,
+        "stop_episode_rate": round(stop_episode_count / total, 4) if total else None,
+        "stop_rate_mean": round(total_stop_rate / total, 4) if total else None,
+        "near_stop_episode_rate": round(near_stop_episode_count / total, 4) if total else None,
+        "near_stop_rate_mean": round(total_near_stop_rate / total, 4) if total else None,
         "lane_change_rate_mean": round(total_lane_change_rate / total, 4) if total else None,
         "flap_accel_decel_rate_mean": round(total_flap_rate / total, 4) if total else None,
         "format_failure_rate_mean": round(total_format_failures / max(total_decisions, 1), 4),
-        "decision_latency_ms_avg": round(total_decision_latency_ms / total, 3) if total else None,
+        "decision_latency_ms_avg": (
+            round(sum(decision_latency_ms_values) / len(decision_latency_ms_values), 3)
+            if decision_latency_ms_values else None
+        ),
         "timeout_penalty_events_total": int(total_timeout_penalty_events),
         "timeout_penalty_timeout_triggers_total": int(total_timeout_penalty_timeout_triggers),
         "timeout_penalty_slow_triggers_total": int(total_timeout_penalty_slow_triggers),
@@ -1045,6 +1697,15 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
             if total else None
         ),
         "timeout_penalty_stage_max_global": max(timeout_penalty_stage_max_values) if timeout_penalty_stage_max_values else 0,
+        "timeout_level_max_sec_mean": (
+            round(sum(timeout_level_max_values) / len(timeout_level_max_values), 4)
+            if timeout_level_max_values else None
+        ),
+        "timeout_escalation_count_mean": round(total_timeout_escalation_count / total, 4) if total else None,
+        "timeout_recovery_count_mean": round(total_timeout_recovery_count / total, 4) if total else None,
+        "timeout_level_15_rate_mean": round(total_timeout_level_15_rate / total, 4) if total else None,
+        "timeout_level_20_rate_mean": round(total_timeout_level_20_rate / total, 4) if total else None,
+        "timeout_level_30_rate_mean": round(total_timeout_level_30_rate / total, 4) if total else None,
         "timeout_penalty_final_decision_timeout_sec_mean": (
             round(sum(timeout_penalty_final_values) / len(timeout_penalty_final_values), 4)
             if timeout_penalty_final_values else None
@@ -1060,44 +1721,31 @@ def aggregate_results(model_name: str, episodes: List[Dict]) -> Dict:
 
     benchmark_episodes = [episode for episode in episodes if "task_completed" in episode]
     if benchmark_episodes:
-        benchmark_total = len(benchmark_episodes)
-        task_completion_count = sum(1 for episode in benchmark_episodes if episode.get("task_completed"))
-        ttc_score_mean = sum(float(episode.get("ttc_score", 0.0) or 0.0) for episode in benchmark_episodes) / max(benchmark_total, 1)
-        speed_variance_score_mean = (
-            sum(float(episode.get("speed_variance_score", 0.0) or 0.0) for episode in benchmark_episodes)
-            / max(benchmark_total, 1)
+        aggregate.update(summarize_benchmark_episodes(benchmark_episodes))
+        benchmark_result_valid, benchmark_result_invalid_reason = benchmark_result_validity(
+            decision_timeout_rate_mean=aggregate.get("decision_timeout_rate_mean"),
+            fallback_action_rate_mean=aggregate.get("fallback_action_rate_mean"),
+            timeout_episode_rate=aggregate.get("timeout_episode_rate"),
         )
-        time_efficiency_score_mean = (
-            sum(float(episode.get("time_efficiency_score", 0.0) or 0.0) for episode in benchmark_episodes)
-            / max(benchmark_total, 1)
-        )
-        overall_score_mean = (
-            sum(float(episode.get("overall_score", 0.0) or 0.0) for episode in benchmark_episodes)
-            / max(benchmark_total, 1)
-        )
-        driving_score_mean = (
-            sum(float(episode.get("driving_score", 0.0) or 0.0) for episode in benchmark_episodes)
-            / max(benchmark_total, 1)
-        )
-        failure_reasons: Dict[str, int] = {}
-        for episode in benchmark_episodes:
-            reason = str(episode.get("benchmark_failure_reason") or "").strip()
-            if reason:
-                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
-
         aggregate.update(
             {
-                "benchmark_case_count": benchmark_total,
-                "task_completion_count": task_completion_count,
-                "task_completion_rate": round(task_completion_count / max(benchmark_total, 1), 4),
-                "ttc_score_mean": round(ttc_score_mean, 4),
-                "speed_variance_score_mean": round(speed_variance_score_mean, 4),
-                "time_efficiency_score_mean": round(time_efficiency_score_mean, 4),
-                "overall_score_mean": round(overall_score_mean, 4),
-                "driving_score": round(driving_score_mean, 4),
-                "benchmark_failure_reasons": failure_reasons,
+                "benchmark_result_valid": bool(benchmark_result_valid),
+                "benchmark_result_invalid_reason": benchmark_result_invalid_reason,
             }
         )
+        if not episode_execution_complete:
+            aggregate["benchmark_result_valid"] = False
+            aggregate["benchmark_result_invalid_reason"] = _extend_invalid_reason(
+                aggregate.get("benchmark_result_invalid_reason"),
+                "incomplete_episode_set",
+            )
+        if model_quarantined_due_to_timeout_collapse:
+            aggregate["benchmark_result_valid"] = False
+            aggregate["benchmark_result_invalid_reason"] = _extend_invalid_reason(
+                aggregate.get("benchmark_result_invalid_reason"),
+                "timeout_collapse_quarantine",
+                model_quarantine_reason,
+            )
 
     return aggregate
 
@@ -1225,10 +1873,10 @@ def _update_experiment_manifest_for_eval(
     write_json_atomic(manifest_path, manifest)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Compare DiLu agent behavior across Ollama models on fixed seeds.")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--models", nargs="+", required=True, help="Model names to compare (e.g. deepseek-r1:14b dilu-llama3_1-8b-v1)")
+    parser.add_argument("--models", nargs="+", required=False, help="Model names to compare (e.g. deepseek-r1:14b dilu-llama3_1-8b-v1)")
     parser.add_argument("--seeds", default=None, help="Comma-separated seeds. Defaults to DiLu fixed seed list.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of seeds after parsing.")
     parser.add_argument(
@@ -1245,6 +1893,27 @@ def main() -> None:
     parser.add_argument("--experiment-id", default=None, help="Experiment id. Defaults to config or timestamp.")
     parser.add_argument("--results-root", default=None, help="Structured results root. Defaults to config or results/experiments.")
     parser.add_argument("--output-root", default=None, help="Optional compare-output folder override.")
+    parser.add_argument(
+        "--energy-mode",
+        choices=["none", "latency_only", "joulescope_hw"],
+        default="none",
+        help="Optional measurement mode. `none` keeps standard evaluation behavior.",
+    )
+    parser.add_argument("--idle-calibration", default=None, help="Path to idle calibration JSON artifact.")
+    parser.add_argument("--calibrate-idle", action="store_true", help="Run idle power calibration and exit.")
+    parser.add_argument("--idle-duration-sec", type=float, default=60.0, help="Idle calibration duration in seconds.")
+    parser.add_argument("--calibration-output", default=None, help="Explicit output path for idle calibration JSON.")
+    parser.add_argument(
+        "--measurement-hard-preflight-policy",
+        choices=["warn_run", "skip_model", "abort_run"],
+        default=None,
+        help="Measurement-mode handling for hard Ollama preflight failures. Default comes from config.",
+    )
+    parser.add_argument(
+        "--action-target-speeds",
+        default=None,
+        help="Optional comma-separated DiscreteMetaAction target speeds, e.g. 0,5,10,15,20,25,30.",
+    )
     parser.add_argument("--no-structured-output", action="store_true", help="Disable structured experiment/model outputs.")
     parser.add_argument("--env-id", default=None, help="Simulation env id override (default: config sim_env_id -> rl_env_id alias -> highway-fast-v0).")
     env_native_group = parser.add_mutually_exclusive_group()
@@ -1284,28 +1953,104 @@ def main() -> None:
         help="Skip the Ollama backend responsiveness probe before evaluation.",
     )
     parser.add_argument(
+        "--strict-ollama-preflight",
+        action="store_true",
+        help="In measurement mode, abort if Ollama preflight fails. Standard eval remains fail-fast by default.",
+    )
+    parser.add_argument(
         "--ollama-preflight-timeout-sec",
         type=float,
         default=None,
         help="Timeout for the Ollama preflight probe. Default: config eval_ollama_preflight_timeout_sec or 15s.",
     )
+    parser.add_argument(
+        "--timeout-early-stop",
+        choices=["on", "off"],
+        default=None,
+        help="Enable or disable early-stop for timeout-collapsing episodes.",
+    )
+    parser.add_argument(
+        "--timeout-early-stop-min-decisions",
+        type=int,
+        default=None,
+        help="Minimum number of decisions before timeout early-stop can trigger.",
+    )
+    parser.add_argument(
+        "--timeout-early-stop-consecutive",
+        type=int,
+        default=None,
+        help="Consecutive timeout+fallback decisions required for early-stop.",
+    )
+    parser.add_argument(
+        "--timeout-early-stop-rate",
+        type=float,
+        default=None,
+        help="Decision-timeout and fallback-rate threshold for early-stop.",
+    )
+    parser.add_argument(
+        "--timeout-early-stop-require-max-level",
+        choices=["on", "off"],
+        default=None,
+        help="Require laddered eval to reach the max timeout rung before early-stop can trigger.",
+    )
+    parser.add_argument(
+        "--timeout-collapse-quarantine-after",
+        type=int,
+        default=None,
+        help="Quarantine a model after this many timeout-cap episodes in the same run.",
+    )
     parser.add_argument("--decision-timeout-sec", type=float, default=None, help="Hard timeout per model decision call. Default: config eval_decision_timeout_sec or 60.")
     parser.add_argument("--decision-max-output-tokens", type=int, default=None, help="Deprecated in policy mode: ignored for timeout-only policy.")
     parser.add_argument("--disable-streaming", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
     parser.add_argument("--disable-checker-llm", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
-    parser.add_argument("--ollama-think-mode", choices=["auto", "think", "no_think"], default=None, help="Deprecated in policy mode: ignored for timeout-only policy.")
-    parser.add_argument("--ollama-use-native-chat", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
-    parser.add_argument("--ollama-disable-native-chat", action="store_true", help="Deprecated in policy mode: ignored for timeout-only policy.")
+    parser.add_argument("--ollama-think-mode", choices=["auto", "think", "no_think"], default=None, help="Measurement mode override for Ollama think mode. Ignored in standard eval mode.")
+    parser.add_argument("--ollama-use-native-chat", action="store_true", help="Measurement mode override to force Ollama native /api/chat. Ignored in standard eval mode.")
+    parser.add_argument("--ollama-disable-native-chat", action="store_true", help="Measurement mode override to force Ollama /v1 transport. Ignored in standard eval mode.")
+    parser.add_argument("--no-ollama-use-native-chat", dest="ollama_disable_native_chat", action="store_true", help="Alias for --ollama-disable-native-chat.")
     parser.add_argument("--alignment-sample-rate", type=float, default=0.0, help="Sampling probability [0,1] for reasoning-alignment sample collection.")
     parser.add_argument("--alignment-max-samples", type=int, default=0, help="Max alignment samples per model.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.quiet and args.no_quiet:
         raise ValueError("Use only one of --quiet or --no-quiet.")
     if args.progress and args.no_progress:
         raise ValueError("Use only one of --progress or --no-progress.")
+    if args.ollama_use_native_chat and args.ollama_disable_native_chat:
+        raise ValueError("Use only one of --ollama-use-native-chat or --ollama-disable-native-chat/--no-ollama-use-native-chat.")
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    config = load_runtime_config(args.config)
+    energy_mode = _normalize_energy_mode(args.energy_mode)
+    measurement_mode = energy_mode != "none"
+    config = _apply_measurement_runtime_overrides(config, args, energy_mode=energy_mode)
+    timeout_early_stop_policy = _resolve_eval_timeout_early_stop_policy(config, args)
+    measurement_hard_preflight_policy = _resolve_measurement_hard_preflight_policy(config, args)
+    if args.calibrate_idle:
+        if energy_mode != "joulescope_hw":
+            raise ValueError("--calibrate-idle requires --energy-mode joulescope_hw.")
+        calibration_experiment_id = args.experiment_id or "energy_latency_benchmark"
+        calibration_root = _resolve_measurement_output_root(
+            args=args,
+            experiment_id=str(calibration_experiment_id),
+        )
+        calibration_path = _calibration_output_path(args=args, output_root=calibration_root)
+        monitor = create_energy_monitor("joulescope_hw")
+        try:
+            written_path = monitor.calibrate_idle(args.idle_duration_sec, calibration_path)
+        finally:
+            monitor.close()
+        print(f"Saved idle calibration: [bold]{written_path}[/bold]")
+        return
+    if not args.models:
+        raise ValueError("--models is required unless --calibrate-idle is used.")
+    idle_calibration = (
+        load_idle_calibration(args.idle_calibration)
+        if (measurement_mode and args.idle_calibration)
+        else None
+    )
+    monitor = (
+        create_energy_monitor(energy_mode, idle_calibration=idle_calibration)
+        if measurement_mode
+        else None
+    )
 
     requested_performance_mode = _resolve_eval_performance_mode(config, args.performance_mode)
     performance_mode_effective = requested_performance_mode
@@ -1361,6 +2106,9 @@ def main() -> None:
             benchmark_cases = benchmark_cases[:args.limit]
         if not benchmark_cases:
             raise ValueError("No benchmark cases to evaluate.")
+        benchmark_case_set = dict(benchmark_case_set)
+        benchmark_case_set["cases"] = list(benchmark_cases)
+        benchmark_case_set["categories"] = sorted({case["category"] for case in benchmark_cases})
         seeds = [int(case["seed"]) for case in benchmark_cases]
     else:
         seeds = parse_seeds(args.seeds)
@@ -1381,6 +2129,8 @@ def main() -> None:
     low_speed_blocking_threshold_mps = float(config.get("metrics_low_speed_blocking_threshold_mps", 8.5))
     blocking_front_gap_safe_m = float(config.get("metrics_blocking_front_gap_safe_m", 25.0))
     blocking_front_ttc_safe_sec = float(config.get("metrics_blocking_front_ttc_safe_sec", 4.0))
+    stop_threshold_mps = float(config.get("metrics_stop_threshold_mps", STOP_THRESHOLD_MPS_DEFAULT))
+    near_stop_threshold_mps = float(config.get("metrics_near_stop_threshold_mps", NEAR_STOP_THRESHOLD_MPS_DEFAULT))
     alignment_sample_rate = max(0.0, min(1.0, float(args.alignment_sample_rate)))
     alignment_max_samples = max(0, int(args.alignment_max_samples))
     structured_output = not args.no_structured_output
@@ -1392,6 +2142,11 @@ def main() -> None:
     ).strip()
     if not eval_run_id:
         eval_run_id = f"eval_run_{current_timestamp()}"
+    if measurement_mode and not structured_output:
+        raise ValueError("--energy-mode requires structured output. Remove --no-structured-output.")
+    if measurement_mode and save_run_artifacts:
+        print("[yellow]Measurement mode disables eval run artifacts to preserve benchmark-compatible outputs.[/yellow]")
+        save_run_artifacts = False
     if save_run_artifacts and not structured_output:
         raise ValueError("--save-run-artifacts requires structured output. Remove --no-structured-output.")
     if not save_run_artifacts:
@@ -1409,6 +2164,21 @@ def main() -> None:
     )
     adaptive_timeout_trigger_consecutive_slow = max(1, adaptive_timeout_trigger_consecutive_slow)
     provider = str(config.get("OPENAI_API_TYPE", "")).strip().lower()
+    eval_timeout_policy_preview = decision_timeout_penalty_snapshot(
+        build_decision_timeout_penalty_state(
+            config=config,
+            provider=provider,
+            mode="eval",
+            baseline_decision_timeout_sec=default_decision_timeout_sec,
+        )
+    )
+    eval_timeout_legacy_fields_ignored = []
+    if eval_timeout_policy_preview.get("policy_mode") == "laddered":
+        eval_timeout_legacy_fields_ignored = [
+            "adaptive_timeout_halving_factor",
+            "adaptive_timeout_min_sec",
+            "adaptive_timeout_trigger_consecutive_slow",
+        ]
     ollama_preflight_enabled = _resolve_eval_ollama_preflight_enabled(
         config,
         cli_skip=bool(args.skip_ollama_preflight),
@@ -1453,8 +2223,16 @@ def main() -> None:
     cli_decision_max_output_tokens = int(args.decision_max_output_tokens) if args.decision_max_output_tokens is not None else None
     cli_disable_streaming = bool(args.disable_streaming)
     cli_disable_checker_llm = bool(args.disable_checker_llm)
-    cli_ollama_think_mode = str(args.ollama_think_mode).strip().lower() if args.ollama_think_mode else None
-    cli_ollama_use_native_chat = bool(args.ollama_use_native_chat or args.ollama_disable_native_chat)
+    cli_ollama_think_mode = (
+        str(args.ollama_think_mode).strip().lower()
+        if (args.ollama_think_mode and not measurement_mode)
+        else None
+    )
+    cli_ollama_use_native_chat = (
+        bool(args.ollama_use_native_chat or args.ollama_disable_native_chat)
+        if not measurement_mode
+        else False
+    )
     cli_policy_overrides = {}
     if cli_decision_timeout_sec is not None:
         cli_policy_overrides["decision_timeout_sec"] = float(cli_decision_timeout_sec)
@@ -1490,40 +2268,80 @@ def main() -> None:
     config["eval_save_run_artifacts"] = bool(save_run_artifacts)
     config["eval_run_id"] = eval_run_id
 
-    results_root = (
-        args.results_root
-        or config.get("results_root")
-        or os.path.join("results", "experiments")
-    )
-    experiment_id = (
-        args.experiment_id
-        or config.get("experiment_id")
-        or current_timestamp()
-    )
-
-    experiment_root = None
-    model_roots: Dict[str, str] = {}
-    compare_dir = None
-    if structured_output:
-        experiment_root = build_experiment_root(results_root, experiment_id)
-        experiment_id = os.path.basename(experiment_root)
-        model_roots = ensure_experiment_layout(experiment_root, args.models)
-        compare_dir = ensure_dir(args.output_root) if args.output_root else ensure_dir(os.path.join(experiment_root, "compare"))
+    if measurement_mode:
+        experiment_id = str(
+            args.experiment_id
+            or config.get("experiment_id")
+            or current_timestamp()
+        )
+        experiment_root = _resolve_measurement_output_root(
+            args=args,
+            experiment_id=experiment_id,
+        )
+        experiment_id = os.path.basename(experiment_root.rstrip("\\/"))
+        model_roots = {model_name: build_model_root(experiment_root, model_name) for model_name in args.models}
+        compare_dir = ensure_dir(os.path.join(experiment_root, "compare"))
     else:
-        compare_dir = ensure_dir(args.output_root) if args.output_root else ensure_dir("results")
+        results_root = (
+            args.results_root
+            or config.get("results_root")
+            or os.path.join("results", "experiments")
+        )
+        experiment_id = (
+            args.experiment_id
+            or config.get("experiment_id")
+            or current_timestamp()
+        )
+
+        experiment_root = None
+        model_roots: Dict[str, str] = {}
+        compare_dir = None
+        if structured_output:
+            experiment_root = build_experiment_root(results_root, experiment_id)
+            experiment_id = os.path.basename(experiment_root)
+            model_roots = ensure_experiment_layout(experiment_root, args.models)
+            compare_dir = ensure_dir(args.output_root) if args.output_root else ensure_dir(os.path.join(experiment_root, "compare"))
+        else:
+            compare_dir = ensure_dir(args.output_root) if args.output_root else ensure_dir("results")
 
     env_bundle = build_env_bundle(
         config,
         env_id_override=args.env_id,
         native_env_defaults_override=args.native_env_defaults,
+        action_target_speeds_override=parse_action_target_speeds(args.action_target_speeds),
     )
     for warning_msg in env_bundle.get("warnings", []):
         print(f"[yellow]{warning_msg}[/yellow]")
     env_config = env_bundle["env_config_map"]
     env_type = str(env_bundle["env_id"])
     env_config_snapshot = env_bundle["env_config_snapshot"]
+    resolved_simulation_duration = _resolve_simulation_duration(config, env_config_snapshot)
+    resolved_action_target_speeds = list(env_bundle.get("resolved_action_target_speeds") or [])
+    env_profile_label = str(env_bundle.get("env_profile_label") or "default")
+    benchmark_validation = None
+    if benchmark_mode and benchmark_case_set is not None:
+        benchmark_validation = validate_benchmark_case_set(
+            benchmark_case_set,
+            env_config,
+            env_type,
+        )
+        if not benchmark_validation.get("passed"):
+            invalid_cases = benchmark_validation.get("invalid_cases", [])
+            invalid_preview = "; ".join(
+                f"{item.get('case_id')} ({', '.join(item.get('reasons') or [])})"
+                for item in invalid_cases[:5]
+            )
+            if len(invalid_cases) > 5:
+                invalid_preview += f"; ... +{len(invalid_cases) - 5} more"
+            raise ValueError(
+                "Benchmark case-set validation failed before model evaluation. "
+                f"invalid_case_count={benchmark_validation['summary'].get('invalid_case_count', 0)}. "
+                f"{invalid_preview}"
+            )
     temp_dir = ensure_dir(os.path.join("temp", "eval_compare"))
     ollama_preflight_results: List[Dict] = []
+    ollama_preflight_warning = None
+    preflight_skip_models: Dict[str, Dict[str, Any]] = {}
     if provider == "ollama" and ollama_preflight_enabled:
         ollama_preflight_results = _run_ollama_preflight(
             config,
@@ -1531,6 +2349,93 @@ def main() -> None:
             timeout_sec=ollama_preflight_timeout_sec,
             quiet_mode=step_log_quiet_mode,
         )
+        preflight_failures = [
+            item for item in ollama_preflight_results
+            if isinstance(item, dict) and not bool(item.get("ok"))
+        ]
+        hard_preflight_failures = [
+            item for item in preflight_failures
+            if _classify_ollama_preflight_failure(item) == "hard"
+        ]
+        soft_preflight_failures = [
+            item for item in preflight_failures
+            if _classify_ollama_preflight_failure(item) != "hard"
+        ]
+        if measurement_mode:
+            ollama_overrides = config.get("_benchmark_ollama_runtime_overrides", {})
+            if ollama_overrides:
+                print(
+                    "[bold cyan]Measurement-mode Ollama overrides[/bold cyan]: "
+                    f"think_mode={ollama_overrides.get('ollama_think_mode')} | "
+                    f"use_native_chat={ollama_overrides.get('ollama_use_native_chat')}"
+                )
+                if ollama_overrides.get("auto_forced_native_chat"):
+                    print(
+                        "[yellow]  Native chat was enabled automatically[/yellow] "
+                        "because a measurement-mode think override was requested."
+                    )
+            if args.strict_ollama_preflight and preflight_failures:
+                raise RuntimeError(_format_ollama_preflight_failures(preflight_failures))
+            if hard_preflight_failures and measurement_hard_preflight_policy == "abort_run":
+                raise RuntimeError(_format_ollama_preflight_failures(hard_preflight_failures))
+            if hard_preflight_failures and measurement_hard_preflight_policy == "skip_model":
+                preflight_skip_models = {
+                    str(item.get("model")): dict(item)
+                    for item in hard_preflight_failures
+                    if item.get("model")
+                }
+                hard_message = _format_ollama_preflight_failures(hard_preflight_failures)
+                ollama_preflight_warning = (
+                    "Measurement-mode preflight skipped hard failures.\n"
+                    f"{hard_message}"
+                )
+                print(
+                    "[yellow]Measurement-mode preflight warning[/yellow]: skipping hard-failed models.\n"
+                    f"{hard_message}"
+                )
+            if soft_preflight_failures:
+                soft_message = _format_ollama_preflight_failures(soft_preflight_failures)
+                ollama_preflight_warning = _extend_invalid_reason(
+                    ollama_preflight_warning,
+                    soft_message,
+                )
+                print(
+                    "[yellow]Measurement-mode preflight warning[/yellow]: continuing despite soft failures.\n"
+                    "For latency/energy benchmarking, a slow first response is itself part of the measurement.\n"
+                    f"{soft_message}"
+                )
+            if (
+                hard_preflight_failures
+                and measurement_hard_preflight_policy == "warn_run"
+                and not args.strict_ollama_preflight
+            ):
+                hard_message = _format_ollama_preflight_failures(hard_preflight_failures)
+                ollama_preflight_warning = _extend_invalid_reason(
+                    ollama_preflight_warning,
+                    hard_message,
+                )
+                print(
+                    "[yellow]Measurement-mode preflight warning[/yellow]: continuing despite failure.\n"
+                    "For latency/energy benchmarking, a slow first response is itself part of the measurement.\n"
+                    f"{hard_message}"
+                )
+        else:
+            if preflight_failures:
+                raise RuntimeError(_format_ollama_preflight_failures(preflight_failures))
+    ollama_preflight_results_by_model = _index_ollama_preflight_results(ollama_preflight_results)
+    measurement_integrity = _build_measurement_integrity_summary(
+        ollama_preflight_results,
+        ollama_preflight_warning,
+        skipped_models_due_to_preflight=[
+            {
+                "model": model_name,
+                "reason": "hard_ollama_preflight_failure",
+                "transport": probe.get("transport"),
+                "error": probe.get("error"),
+            }
+            for model_name, probe in preflight_skip_models.items()
+        ],
+    )
     shared_agent_memory: Optional[DrivingMemory] = None
     if int(few_shot_num) > 0:
         configure_runtime_env(
@@ -1558,9 +2463,27 @@ def main() -> None:
         "performance_optimizations_applied": sorted(set(performance_optimizations_applied)),
         "ollama_preflight_enabled": bool(provider == "ollama" and ollama_preflight_enabled),
         "ollama_preflight_timeout_sec": ollama_preflight_timeout_sec if provider == "ollama" else None,
+        "measurement_hard_preflight_policy": (
+            measurement_hard_preflight_policy
+            if provider == "ollama" and measurement_mode
+            else None
+        ),
         "ollama_preflight_results": ollama_preflight_results if provider == "ollama" else [],
+        "ollama_preflight_warning": ollama_preflight_warning if measurement_mode else None,
+        "measurement_integrity_warnings": list(measurement_integrity.get("measurement_integrity_warnings", [])),
+        "ollama_preflight_failed_models": list(measurement_integrity.get("ollama_preflight_failed_models", [])),
+        "skipped_models_due_to_preflight": list(measurement_integrity.get("skipped_models_due_to_preflight", [])),
+        "quarantined_models_due_to_timeout_collapse": list(
+            measurement_integrity.get("quarantined_models_due_to_timeout_collapse", [])
+        ),
         "openai_api_type": config["OPENAI_API_TYPE"],
         "benchmark_mode": bool(benchmark_mode),
+        "headline_task_metric": (
+            benchmark_metric_config().get("recommended_headline_metric")
+            if benchmark_mode
+            else None
+        ),
+        "efficiency_metrics_reported": bool(measurement_mode),
         "benchmark_case_set": (
             benchmark_case_set["benchmark_name"] if benchmark_case_set is not None else None
         ),
@@ -1570,12 +2493,23 @@ def main() -> None:
         "benchmark_categories": (
             list(benchmark_case_set["categories"]) if benchmark_case_set is not None else []
         ),
+        "resolved_action_target_speeds": list(resolved_action_target_speeds),
+        "env_profile_label": env_profile_label,
+        "benchmark_validation_passed": (
+            bool(benchmark_validation.get("passed")) if benchmark_validation is not None else None
+        ),
+        "benchmark_invalid_cases": (
+            benchmark_validation.get("invalid_cases", []) if benchmark_validation is not None else []
+        ),
+        "benchmark_validation_summary": (
+            benchmark_validation.get("summary") if benchmark_validation is not None else None
+        ),
         "models": args.models,
         "model_roots": model_roots,
         "seeds": seeds,
         "few_shot_num": few_shot_num,
         "memory_path": config["memory_path"],
-        "simulation_duration": int(config["simulation_duration"]),
+        "simulation_duration": int(resolved_simulation_duration),
         "metrics_config": {
             "env_id": str(env_type),
             "native_env_defaults": bool(env_bundle.get("use_native_env_defaults")),
@@ -1585,6 +2519,8 @@ def main() -> None:
                 "native_env_defaults": env_bundle.get("native_source"),
             },
             "env_resolution_warnings": list(env_bundle.get("warnings", [])),
+            "resolved_action_target_speeds": list(resolved_action_target_speeds),
+            "env_profile_label": env_profile_label,
             "env_config_snapshot": _json_safe(copy.deepcopy(env_config_snapshot)),
             "ttc_threshold_sec": ttc_threshold_sec,
             "headway_threshold_m": headway_threshold_m,
@@ -1593,7 +2529,13 @@ def main() -> None:
             "low_speed_blocking_threshold_mps": low_speed_blocking_threshold_mps,
             "blocking_front_gap_safe_m": blocking_front_gap_safe_m,
             "blocking_front_ttc_safe_sec": blocking_front_ttc_safe_sec,
+            "stop_threshold_mps": stop_threshold_mps,
+            "near_stop_threshold_mps": near_stop_threshold_mps,
             "flapping_mode": "accel_decel",
+            "eval_timeout_policy_mode": eval_timeout_policy_preview.get("policy_mode"),
+            "eval_timeout_ladder_sec": eval_timeout_policy_preview.get("timeout_ladder_sec"),
+            "eval_timeout_recovery_successes": eval_timeout_policy_preview.get("recovery_successes_required"),
+            "eval_timeout_legacy_fields_ignored": list(eval_timeout_legacy_fields_ignored),
             "decision_timeout_sec": round(max(1.0, default_decision_timeout_sec), 3),
             "slow_decision_threshold_sec": round(max(0.001, slow_decision_threshold_sec), 3),
             "model_overrides_enabled": bool(legacy_eval_overrides),
@@ -1623,6 +2565,8 @@ def main() -> None:
             "performance_optimizations_applied": sorted(set(performance_optimizations_applied)),
             "ollama_preflight_enabled": bool(provider == "ollama" and ollama_preflight_enabled),
             "ollama_preflight_timeout_sec": ollama_preflight_timeout_sec if provider == "ollama" else None,
+            "measurement_hard_preflight_policy": measurement_hard_preflight_policy if provider == "ollama" else None,
+            "timeout_early_stop_policy": dict(timeout_early_stop_policy),
             "alignment_sample_rate": alignment_sample_rate,
             "alignment_max_samples": alignment_max_samples,
             "benchmark_mode": bool(benchmark_mode),
@@ -1636,6 +2580,15 @@ def main() -> None:
                 list(benchmark_case_set["categories"]) if benchmark_case_set is not None else []
             ),
             "benchmark_metric_config": benchmark_metric_config() if benchmark_mode else None,
+            "benchmark_validation_passed": (
+                bool(benchmark_validation.get("passed")) if benchmark_validation is not None else None
+            ),
+            "benchmark_invalid_cases": (
+                benchmark_validation.get("invalid_cases", []) if benchmark_validation is not None else []
+            ),
+            "benchmark_validation_summary": (
+                benchmark_validation.get("summary") if benchmark_validation is not None else None
+            ),
         },
         "per_model": {},
         "aggregates": [],
@@ -1644,17 +2597,54 @@ def main() -> None:
         "model_run_outputs": {},
         "model_runtime_policies": {},
     }
+    if measurement_mode:
+        report.update(
+            {
+                "source": "evaluate_models_ollama:measurement_mode",
+                "output_root": experiment_root,
+                "energy_mode_requested": args.energy_mode,
+                "energy_mode_effective": energy_mode,
+                "idle_calibration_path": args.idle_calibration,
+                "idle_calibration": idle_calibration,
+                "hardware_info": system_hardware_snapshot(),
+                "ollama_runtime_overrides": config.get("_benchmark_ollama_runtime_overrides", {}),
+                "ollama_preflight_strict": bool(args.strict_ollama_preflight),
+                "model_runtime_metadata": {},
+                "energy_tradeoff_summary": {},
+                "model_outputs": {},
+            }
+        )
+        report["metrics_config"].update(
+            {
+                "few_shot_num": few_shot_num,
+                "energy_mode": energy_mode,
+                "idle_baseline_subtraction_enabled": bool(
+                    idle_calibration is not None and idle_calibration.get("avg_idle_power_w") is not None
+                ),
+                "token_count_method": "ollama_usage_with_estimate_fallback",
+                "ollama_runtime_overrides": config.get("_benchmark_ollama_runtime_overrides", {}),
+            }
+        )
     if benchmark_mode and benchmark_case_set is not None:
         print(
             "[bold cyan]Benchmark mode[/bold cyan]: "
             f"{benchmark_case_set['benchmark_name']} | cases={len(benchmark_cases)} | "
             f"categories={', '.join(benchmark_case_set['categories'])}"
         )
+        if benchmark_validation is not None:
+            summary = benchmark_validation.get("summary", {})
+            print(
+                "[bold cyan]Benchmark validation[/bold cyan]: "
+                f"passed={benchmark_validation.get('passed')} | "
+                f"valid_cases={summary.get('valid_case_count')} | "
+                f"invalid_cases={summary.get('invalid_case_count')}"
+            )
 
     aggregate_by_model: Dict[str, Dict] = {}
     model_run_outputs: Dict[str, Dict[str, str]] = {}
     model_metrics_configs: Dict[str, Dict] = {}
     deprecated_policy_fields_ignored_union = set(deprecated_cli_policy_flags)
+    quarantined_models_due_to_timeout_collapse: List[Dict[str, Any]] = []
     episode_specs: List = benchmark_cases if benchmark_mode else list(seeds)
     progress_cm = (
         Progress(
@@ -1690,7 +2680,7 @@ def main() -> None:
                 policy_meta.get("deprecated_policy_fields_ignored", []) or []
             )
             resolved_decision_timeout_sec = float(resolved_policy["decision_timeout_sec"])
-            timeout_penalty_state = build_decision_timeout_penalty_state(
+            baseline_timeout_penalty_state = build_decision_timeout_penalty_state(
                 config=config,
                 provider=provider,
                 mode="eval",
@@ -1714,9 +2704,14 @@ def main() -> None:
                     "legacy_eval_model": policy_meta.get("matched_eval_model_override_key"),
                 },
                 "deprecated_policy_fields_ignored": policy_meta.get("deprecated_policy_fields_ignored", []),
-                "decision_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
+                "decision_timeout_penalty": decision_timeout_penalty_snapshot(baseline_timeout_penalty_state),
+                "eval_timeout_policy_mode": eval_timeout_policy_preview.get("policy_mode"),
+                "eval_timeout_ladder_sec": eval_timeout_policy_preview.get("timeout_ladder_sec"),
+                "eval_timeout_recovery_successes": eval_timeout_policy_preview.get("recovery_successes_required"),
+                "eval_timeout_legacy_fields_ignored": list(eval_timeout_legacy_fields_ignored),
+                "timeout_early_stop_policy": dict(timeout_early_stop_policy),
                 # Deprecated alias key for one transition cycle.
-                "native_timeout_penalty": decision_timeout_penalty_snapshot(timeout_penalty_state),
+                "native_timeout_penalty": decision_timeout_penalty_snapshot(baseline_timeout_penalty_state),
             }
             model_metrics_configs[model_name] = {
                 **dict(report["metrics_config"]),
@@ -1742,19 +2737,58 @@ def main() -> None:
                     "[yellow]  Deprecated policy fields ignored:[/yellow] "
                     f"{', '.join(policy_meta['deprecated_policy_fields_ignored'])}"
                 )
-            penalty_snapshot = decision_timeout_penalty_snapshot(timeout_penalty_state)
-            emit(
-                "[dim]  Adaptive decision-timeout penalty: enabled={enabled}, baseline={baseline}s, floor={floor}s, "
-                "factor={factor}, trigger_consecutive_slow={trigger}[/dim]".format(
-                    enabled=bool(penalty_snapshot.get("enabled")),
-                    baseline=round(float(penalty_snapshot.get("baseline_decision_timeout_sec") or 0.0), 3),
-                    floor=round(float(penalty_snapshot.get("min_timeout_sec") or 0.0), 3),
-                    factor=round(float(penalty_snapshot.get("halving_factor") or 0.0), 3),
-                    trigger=int(penalty_snapshot.get("trigger_consecutive_slow") or 0),
+            penalty_snapshot = decision_timeout_penalty_snapshot(baseline_timeout_penalty_state)
+            if penalty_snapshot.get("policy_mode") == "laddered":
+                ladder_values = penalty_snapshot.get("timeout_ladder_sec") or []
+                ladder_label = " -> ".join(
+                    str(int(value)) if float(value).is_integer() else str(value)
+                    for value in ladder_values
                 )
-            )
+                emit(
+                    "[dim]  Eval timeout ladder: levels={levels}s | recovery_successes={recovery} | "
+                    "active_timeout={active}s[/dim]".format(
+                        levels=ladder_label,
+                        recovery=int(penalty_snapshot.get("recovery_successes_required") or 0),
+                        active=round(float(penalty_snapshot.get("effective_decision_timeout_sec") or 0.0), 3),
+                    )
+                )
+                if eval_timeout_legacy_fields_ignored:
+                    emit(
+                        "[dim]  Legacy adaptive eval fields ignored in laddered mode: "
+                        f"{', '.join(eval_timeout_legacy_fields_ignored)}[/dim]"
+                    )
+            else:
+                emit(
+                    "[dim]  Adaptive decision-timeout penalty: enabled={enabled}, baseline={baseline}s, floor={floor}s, "
+                    "factor={factor}, trigger_consecutive_slow={trigger}[/dim]".format(
+                        enabled=bool(penalty_snapshot.get("enabled")),
+                        baseline=round(float(penalty_snapshot.get("baseline_decision_timeout_sec") or 0.0), 3),
+                        floor=round(float(penalty_snapshot.get("min_timeout_sec") or 0.0), 3),
+                        factor=round(float(penalty_snapshot.get("halving_factor") or 0.0), 3),
+                        trigger=int(penalty_snapshot.get("trigger_consecutive_slow") or 0),
+                    )
+                )
             model_run_dir = None
             model_log_path = None
+            model_energy_dir = None
+            measurements_path = None
+            action_traces_path = None
+            measurement_rows: List[Dict] = []
+            action_trace_rows: List[Dict] = []
+            if measurement_mode:
+                report["model_runtime_metadata"][model_name] = (
+                    _inspect_ollama_model(model_name)
+                    if provider == "ollama"
+                    else {"model_tag": model_name}
+                )
+                emit(
+                    f"[dim]  Measurement mode={energy_mode} | env_id={env_type} | "
+                    f"episodes={len(episode_specs)} | few_shot_num={few_shot_num}[/dim]"
+                )
+                model_energy_dir = ensure_dir(os.path.join(model_roots[model_name], "energy"))
+                measurement_ts = current_timestamp()
+                measurements_path = os.path.join(model_energy_dir, f"episode_measurements_{measurement_ts}.json")
+                action_traces_path = os.path.join(model_energy_dir, f"action_traces_{measurement_ts}.json")
             if save_run_artifacts:
                 model_run_dir = build_model_run_dir(experiment_root, model_name, eval_run_id)
                 model_log_path = os.path.join(model_run_dir, "log.txt")
@@ -1767,10 +2801,30 @@ def main() -> None:
                         )
                     )
 
+            planned_episode_count = len(episode_specs)
+            if measurement_mode and model_name in preflight_skip_models:
+                emit(
+                    "[yellow]  Skipping model due to hard Ollama preflight failure[/yellow]: "
+                    f"{preflight_skip_models[model_name].get('error')}"
+                )
+                report["per_model"][model_name] = []
+                agg = _build_skipped_model_aggregate(
+                    model_name=model_name,
+                    planned_episode_count=planned_episode_count,
+                    reason="hard_ollama_preflight_failure",
+                    preflight_probe=preflight_skip_models.get(model_name),
+                    benchmark_mode=benchmark_mode,
+                )
+                report["aggregates"].append(agg)
+                aggregate_by_model[model_name] = agg
+                if model_task is not None:
+                    progress.update(model_task, advance=1)
+                continue
+
             seed_task = (
                 progress.add_task(
                     f"{model_name} {'cases' if benchmark_mode else 'seeds'}",
-                    total=len(episode_specs),
+                    total=planned_episode_count,
                 )
                 if progress is not None
                 else None
@@ -1782,10 +2836,10 @@ def main() -> None:
                         benchmark_max_steps(
                             benchmark_cases[0],
                             env_config_snapshot,
-                            int(config["simulation_duration"]),
+                            int(resolved_simulation_duration),
                         )
                         if benchmark_mode and benchmark_cases
-                        else int(config["simulation_duration"])
+                        else int(resolved_simulation_duration)
                     ),
                 )
                 if progress is not None
@@ -1793,13 +2847,16 @@ def main() -> None:
             )
             episodes = []
             model_alignment_samples = []
+            timeout_cap_episode_count = 0
+            model_quarantined_due_to_timeout_collapse = False
+            model_quarantine_reason = None
             for idx, episode_spec in enumerate(episode_specs, start=1):
                 benchmark_case = episode_spec if benchmark_mode else None
                 seed = int(benchmark_case["seed"]) if benchmark_case is not None else int(episode_spec)
                 case_env_config = env_config
                 case_env_snapshot = env_config_snapshot
                 case_instruction = None
-                case_max_steps = int(config["simulation_duration"])
+                case_max_steps = int(resolved_simulation_duration)
                 case_label = f"seed {idx}/{len(episode_specs)}"
                 if benchmark_case is not None:
                     case_env_config, case_env_snapshot = build_case_env_config(
@@ -1810,7 +2867,7 @@ def main() -> None:
                     case_max_steps = benchmark_max_steps(
                         benchmark_case,
                         case_env_snapshot,
-                        int(config["simulation_duration"]),
+                        int(resolved_simulation_duration),
                     )
                     case_instruction = build_benchmark_instruction(benchmark_case)
                     case_label = f"case {idx}/{len(episode_specs)}"
@@ -1832,6 +2889,15 @@ def main() -> None:
                         total=int(case_max_steps),
                         completed=0,
                     )
+                timeout_penalty_state = build_decision_timeout_penalty_state(
+                    config=config,
+                    provider=provider,
+                    mode="eval",
+                    baseline_decision_timeout_sec=resolved_decision_timeout_sec,
+                )
+                decision_token_usage_records: List[Dict] = []
+                action_trace: List[Dict] = []
+                first_action_latency_sec: Optional[float] = None
 
                 def _on_step(step_completed: int, done: bool) -> None:
                     if progress is not None and step_task is not None:
@@ -1840,12 +2906,61 @@ def main() -> None:
                             completed=min(int(step_completed), int(case_max_steps)),
                         )
 
-                def _on_decision(step_idx: int, action_id: int, response_text: str, _decision_meta: Dict) -> None:
+                def _on_decision(step_idx: int, action_id: int, response_text: str, decision_meta: Dict) -> None:
+                    nonlocal first_action_latency_sec
+                    if measurement_mode:
+                        token_usage_record = {
+                            "prompt_tokens": int(decision_meta.get("prompt_tokens", 0) or 0),
+                            "completion_tokens": int(decision_meta.get("completion_tokens", 0) or 0),
+                            "total_tokens": int(decision_meta.get("total_tokens", 0) or 0),
+                            "token_count_method": decision_meta.get("token_count_method"),
+                            "token_usage_source": decision_meta.get("token_usage_source"),
+                        }
+                        decision_token_usage_records.append(token_usage_record)
+                        if first_action_latency_sec is None and decision_meta.get("decision_elapsed_sec") is not None:
+                            first_action_latency_sec = float(decision_meta.get("decision_elapsed_sec"))
+                        action_trace.append(
+                            {
+                                "step_idx": int(step_idx),
+                                "action_id": int(action_id),
+                                "decision_elapsed_sec": (
+                                    round(float(decision_meta.get("decision_elapsed_sec")), 6)
+                                    if decision_meta.get("decision_elapsed_sec") is not None
+                                    else None
+                                ),
+                                "timed_out": bool(decision_meta.get("timed_out", False)),
+                                "used_fallback": bool(decision_meta.get("used_fallback", False)),
+                                "ollama_transport": decision_meta.get("ollama_transport"),
+                                "ollama_requested_think_mode": decision_meta.get("ollama_requested_think_mode"),
+                                "ollama_effective_think_mode": decision_meta.get("ollama_effective_think_mode"),
+                                "ollama_native_timeout": bool(decision_meta.get("ollama_native_timeout", False)),
+                                "ollama_native_timeout_short_circuit": bool(
+                                    decision_meta.get("ollama_native_timeout_short_circuit", False)
+                                ),
+                                "prompt_tokens": int(decision_meta.get("prompt_tokens", 0) or 0),
+                                "completion_tokens": int(decision_meta.get("completion_tokens", 0) or 0),
+                                "total_tokens": int(decision_meta.get("total_tokens", 0) or 0),
+                                "token_count_method": decision_meta.get("token_count_method"),
+                                "token_usage_source": decision_meta.get("token_usage_source"),
+                                "response_text": response_text,
+                            }
+                        )
                     if effective_eval_progress_reply_mode == "compact":
                         emit(_compact_reply_preview(step_idx, action_id, response_text))
                     elif effective_eval_progress_reply_mode == "full":
                         emit(_full_reply_preview(step_idx, action_id, response_text))
 
+                episode_wall_time_start = (
+                    datetime.now().isoformat(timespec="seconds") if measurement_mode else None
+                )
+                if measurement_mode and monitor is not None:
+                    monitor.start_episode(
+                        {
+                            "model": model_name,
+                            "seed": seed,
+                            "case_id": benchmark_case.get("case_id") if benchmark_case is not None else None,
+                        }
+                    )
                 episode_result = run_episode(
                     config=config,
                     env_config=case_env_config,
@@ -1861,6 +2976,8 @@ def main() -> None:
                     low_speed_blocking_threshold_mps=low_speed_blocking_threshold_mps,
                     blocking_front_gap_safe_m=blocking_front_gap_safe_m,
                     blocking_front_ttc_safe_sec=blocking_front_ttc_safe_sec,
+                    stop_threshold_mps=stop_threshold_mps,
+                    near_stop_threshold_mps=near_stop_threshold_mps,
                     alignment_sample_rate=alignment_sample_rate,
                     alignment_max_samples=alignment_max_samples,
                     slow_decision_threshold_sec=slow_decision_threshold_sec,
@@ -1876,12 +2993,51 @@ def main() -> None:
                     benchmark_case=benchmark_case,
                     driving_instruction=case_instruction,
                     max_steps_override=case_max_steps,
+                    timeout_early_stop_policy=timeout_early_stop_policy,
                 )
+                measurement = monitor.stop_episode() if (measurement_mode and monitor is not None) else {}
+                if measurement_mode:
+                    episode_wall_time_end = datetime.now().isoformat(timespec="seconds")
+                    episode_token_usage = aggregate_episode_token_usage(decision_token_usage_records)
+                    episode_result = enrich_episode_energy_metrics(
+                        episode_result,
+                        energy_mode=energy_mode,
+                        raw_energy_j=measurement.get("raw_energy_j"),
+                        idle_power_w=monitor.idle_power_w if monitor is not None else None,
+                        avg_power_w=measurement.get("avg_power_w"),
+                        peak_power_w=measurement.get("peak_power_w"),
+                        prompt_tokens_total=int(episode_token_usage.get("prompt_tokens_total", 0)),
+                        completion_tokens_total=int(episode_token_usage.get("completion_tokens_total", 0)),
+                        total_tokens=int(episode_token_usage.get("total_tokens", 0)),
+                        token_count_method=str(episode_token_usage.get("token_count_method") or TOKEN_COUNT_METHOD),
+                        token_usage_source=str(episode_token_usage.get("token_usage_source") or "estimate_fallback"),
+                        latency_to_first_action_sec=first_action_latency_sec,
+                    )
+                    episode_result["episode_wall_time_start"] = episode_wall_time_start
+                    episode_result["episode_wall_time_end"] = episode_wall_time_end
+                    episode_result["energy_measurement_meta"] = measurement.get("measurement_meta", {})
+                    episode_result["action_sequence"] = [int(item["action_id"]) for item in action_trace]
+                    episode_result["action_histogram"] = _action_histogram(action_trace)
                 episode_alignment_samples = episode_result.pop("alignment_samples", [])
                 for sample in episode_alignment_samples:
                     sample["model"] = model_name
                     model_alignment_samples.append(sample)
                 episodes.append(episode_result)
+                if measurement_mode:
+                    measurement_rows.append(_measurement_record(episode_result))
+                    action_trace_rows.append(
+                        {
+                            "episode_id": str(episode_result.get("case_id") or f"seed_{episode_result.get('seed')}"),
+                            "seed": episode_result.get("seed"),
+                            "case_id": episode_result.get("case_id"),
+                            "category": episode_result.get("category"),
+                            "crashed": bool(episode_result.get("crashed", False)),
+                            "task_completed": episode_result.get("task_completed"),
+                            "action_sequence": list(episode_result.get("action_sequence") or []),
+                            "action_histogram": dict(episode_result.get("action_histogram") or {}),
+                            "trace": action_trace,
+                        }
+                    )
                 if save_run_artifacts and model_log_path:
                     _append_eval_run_log(model_log_path, model_name, episode_result)
                 if progress is not None and seed_task is not None:
@@ -1889,9 +3045,14 @@ def main() -> None:
                 status = "CRASH" if episode_result["crashed"] else ("ERROR" if episode_result["error"] else ("TIMEOUT" if episode_result.get("timeout_triggered") else "OK"))
                 benchmark_suffix = ""
                 if "task_completed" in episode_result:
+                    driving_score_value = episode_result.get("driving_score_v2")
+                    driving_score_label = "driving_score_v2"
+                    if driving_score_value is None:
+                        driving_score_value = episode_result.get("driving_score")
+                        driving_score_label = "driving_score"
                     benchmark_suffix = (
                         f" | task_completed={episode_result.get('task_completed')} "
-                        f"| driving_score={episode_result.get('driving_score')}"
+                        f"| {driving_score_label}={driving_score_value}"
                     )
                 emit(
                     f"    -> {status} | steps={episode_result['steps']}/{episode_result['max_steps']} "
@@ -1900,21 +3061,133 @@ def main() -> None:
                 )
                 if episode_result["error"]:
                     emit(f"    -> [red]{episode_result['error']}[/red]")
+                if episode_result.get("episode_stop_reason") == "episode_timeout_cap":
+                    timeout_cap_episode_count += 1
+                    if timeout_cap_episode_count >= int(timeout_early_stop_policy.get("quarantine_after_collapses", 2)):
+                        remaining_episodes = planned_episode_count - len(episodes)
+                        if remaining_episodes > 0:
+                            model_quarantined_due_to_timeout_collapse = True
+                            model_quarantine_reason = "timeout_collapse_quarantine"
+                            quarantined_models_due_to_timeout_collapse.append(
+                                {
+                                    "model": model_name,
+                                    "reason": model_quarantine_reason,
+                                    "timeout_cap_episode_count": int(timeout_cap_episode_count),
+                                    "remaining_episode_count": int(remaining_episodes),
+                                }
+                            )
+                            emit(
+                                "[yellow]  Quarantining remaining episodes for model[/yellow]: "
+                                f"remaining={remaining_episodes} after {timeout_cap_episode_count} timeout-cap episode(s)"
+                            )
+                            if progress is not None and seed_task is not None:
+                                progress.update(seed_task, completed=planned_episode_count)
+                            break
 
             report["model_runtime_policies"][model_name]["decision_timeout_penalty"] = (
-                decision_timeout_penalty_snapshot(timeout_penalty_state)
+                decision_timeout_penalty_snapshot(
+                    build_decision_timeout_penalty_state(
+                        config=config,
+                        provider=provider,
+                        mode="eval",
+                        baseline_decision_timeout_sec=resolved_decision_timeout_sec,
+                    )
+                )
             )
             report["model_runtime_policies"][model_name]["native_timeout_penalty"] = (
-                decision_timeout_penalty_snapshot(timeout_penalty_state)
+                decision_timeout_penalty_snapshot(
+                    build_decision_timeout_penalty_state(
+                        config=config,
+                        provider=provider,
+                        mode="eval",
+                        baseline_decision_timeout_sec=resolved_decision_timeout_sec,
+                    )
+                )
             )
             model_metrics_configs[model_name]["resolved_model_policy"] = dict(
                 report["model_runtime_policies"][model_name]
             )
             report["per_model"][model_name] = episodes
-            agg = aggregate_results(model_name, episodes)
+            agg = aggregate_results(
+                model_name,
+                episodes,
+                planned_episode_count=planned_episode_count,
+                model_quarantined_due_to_timeout_collapse=model_quarantined_due_to_timeout_collapse,
+                model_quarantine_reason=model_quarantine_reason,
+            )
+            agg = _annotate_aggregate_with_ollama_preflight_status(
+                agg,
+                ollama_preflight_results_by_model,
+            )
+            if measurement_mode:
+                agg.update(summarize_energy_latency_episodes(episodes))
+                if "task_completion_rate" in agg:
+                    benchmark_valid, benchmark_invalid_reason = benchmark_result_validity(
+                        decision_timeout_rate_mean=agg.get("decision_timeout_rate_mean"),
+                        fallback_action_rate_mean=agg.get("fallback_action_rate_mean"),
+                        timeout_episode_rate=agg.get("timeout_episode_rate"),
+                    )
+                    agg["benchmark_result_valid"] = bool(benchmark_valid)
+                    agg["benchmark_result_invalid_reason"] = benchmark_invalid_reason
+                    if not agg.get("episode_execution_complete", True):
+                        agg["benchmark_result_valid"] = False
+                        agg["benchmark_result_invalid_reason"] = _extend_invalid_reason(
+                            agg.get("benchmark_result_invalid_reason"),
+                            "incomplete_episode_set",
+                        )
+                    if agg.get("model_quarantined_due_to_timeout_collapse"):
+                        agg["benchmark_result_valid"] = False
+                        agg["benchmark_result_invalid_reason"] = _extend_invalid_reason(
+                            agg.get("benchmark_result_invalid_reason"),
+                            "timeout_collapse_quarantine",
+                            agg.get("model_quarantine_reason"),
+                        )
             report["aggregates"].append(agg)
             aggregate_by_model[model_name] = agg
             report["alignment_samples"].extend(model_alignment_samples[:alignment_max_samples] if alignment_max_samples > 0 else [])
+            if measurement_mode and model_energy_dir and measurements_path and action_traces_path:
+                summary_ts = current_timestamp()
+                summary_path = os.path.join(model_energy_dir, f"energy_summary_{summary_ts}.json")
+                episodes_path = os.path.join(model_energy_dir, f"energy_episodes_{summary_ts}.json")
+                write_json_atomic(
+                    summary_path,
+                    _build_model_extract(
+                        model_name=model_name,
+                        experiment_id=experiment_id,
+                        source_compare_report="",
+                        aggregate=agg,
+                        episodes=episodes,
+                        metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
+                    ),
+                )
+                write_json_atomic(
+                    episodes_path,
+                    {
+                        "model": model_name,
+                        "experiment_id": experiment_id,
+                        "episodes": episodes,
+                    },
+                )
+                write_json_atomic(
+                    measurements_path,
+                    {"model": model_name, "measurements": measurement_rows},
+                )
+                write_json_atomic(
+                    action_traces_path,
+                    {
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "source": "evaluate_models_ollama:measurement_mode:action_traces",
+                        "model": model_name,
+                        "experiment_id": experiment_id,
+                        "episodes": action_trace_rows,
+                    },
+                )
+                report["model_outputs"][model_name] = {
+                    "summary": summary_path,
+                    "episodes": episodes_path,
+                    "measurements": measurements_path,
+                    "action_traces": action_traces_path,
+                }
             if save_run_artifacts and model_run_dir:
                 run_metrics_report = _build_eval_run_metrics_report(
                     model_name=model_name,
@@ -1926,7 +3199,7 @@ def main() -> None:
                     openai_api_type=str(config.get("OPENAI_API_TYPE", "")),
                     few_shot_num=int(few_shot_num),
                     memory_path=str(config.get("memory_path", "")),
-                    simulation_duration=int(config["simulation_duration"]),
+                    simulation_duration=int(resolved_simulation_duration),
                     metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
                     episodes=episodes,
                     aggregate=agg,
@@ -1950,102 +3223,202 @@ def main() -> None:
     report["metrics_config"]["deprecated_policy_fields_ignored"] = sorted(
         deprecated_policy_fields_ignored_union
     )
+    measurement_integrity = _build_measurement_integrity_summary(
+        ollama_preflight_results,
+        ollama_preflight_warning,
+        skipped_models_due_to_preflight=list(report.get("skipped_models_due_to_preflight", [])),
+        quarantined_models_due_to_timeout_collapse=quarantined_models_due_to_timeout_collapse,
+    )
+    report["measurement_integrity_warnings"] = list(measurement_integrity.get("measurement_integrity_warnings", []))
+    report["ollama_preflight_failed_models"] = list(measurement_integrity.get("ollama_preflight_failed_models", []))
+    report["skipped_models_due_to_preflight"] = list(measurement_integrity.get("skipped_models_due_to_preflight", []))
+    report["quarantined_models_due_to_timeout_collapse"] = list(
+        measurement_integrity.get("quarantined_models_due_to_timeout_collapse", [])
+    )
     report["model_run_outputs"] = model_run_outputs
 
     user_out_path = None
     if args.output:
         user_out_path = ensure_parent_dir(args.output)
-        write_json_atomic(user_out_path, report)
-
-    if structured_output:
-        out_path = timestamped_results_path("eval_compare", ext=".json", results_dir=compare_dir)
+    if measurement_mode:
+        report["energy_tradeoff_summary"] = build_energy_tradeoff_summary(report["aggregates"])
+        out_path = timestamped_results_path("energy_latency_compare", ext=".json", results_dir=compare_dir)
+        report["compare_report_path"] = out_path
         write_json_atomic(out_path, report)
-    else:
+        for model_name, outputs in report.get("model_outputs", {}).items():
+            if not outputs.get("summary"):
+                continue
+            write_json_atomic(
+                outputs["summary"],
+                _build_model_extract(
+                    model_name=model_name,
+                    experiment_id=experiment_id,
+                    source_compare_report=out_path,
+                    aggregate=aggregate_by_model[model_name],
+                    episodes=report["per_model"][model_name],
+                    metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
+                ),
+            )
+        write_json_atomic(out_path, report)
         if user_out_path:
-            out_path = user_out_path
-        else:
+            write_json_atomic(user_out_path, report)
+
+        print("\n[bold green]Energy / Latency Summary[/bold green]")
+        for row in report["aggregates"]:
+            summary = (
+                f"- {row['model']}: crash_rate={row.get('crash_rate')}, "
+                f"stop_episode_rate={row.get('stop_episode_rate')}, "
+                f"net_energy_j_mean={row.get('net_energy_j_mean')}, "
+                f"energy_per_decision_j_mean={row.get('energy_per_decision_j_mean')}, "
+                f"tokens_per_second_mean={row.get('tokens_per_second_mean')}, "
+                f"decision_latency_ms_avg_mean={row.get('decision_latency_ms_avg_mean')}, "
+                f"p95_decision_latency_sec_mean={row.get('p95_decision_latency_sec_mean')}"
+            )
+            if row.get("task_completion_rate") is not None:
+                driving_score_value = row.get("driving_score_v2")
+                driving_score_label = "driving_score_v2"
+                if driving_score_value is None:
+                    driving_score_value = row.get("driving_score")
+                    driving_score_label = "driving_score"
+                summary += (
+                    f", task_completion_rate={row.get('task_completion_rate')}, "
+                    f"{driving_score_label}={driving_score_value}, "
+                    f"benchmark_result_valid={row.get('benchmark_result_valid')}"
+                )
+            if row.get("ollama_preflight_ok") is False:
+                summary += ", ollama_preflight_ok=False"
+            print(summary)
+        if report.get("ollama_preflight_failed_models"):
+            print("\n[yellow]Measurement integrity warnings[/yellow]")
+            for item in report["ollama_preflight_failed_models"]:
+                print(
+                    f"- model={item.get('model')} transport={item.get('transport')} "
+                    f"error={item.get('error')}"
+                )
+        print(f"\nSaved report: [bold]{out_path}[/bold]")
+        if user_out_path and user_out_path != out_path:
+            print(f"Saved user-requested output copy: [bold]{user_out_path}[/bold]")
+    else:
+        if structured_output:
             out_path = timestamped_results_path("eval_compare", ext=".json", results_dir=compare_dir)
             write_json_atomic(out_path, report)
+        else:
+            if user_out_path:
+                out_path = user_out_path
+            else:
+                out_path = timestamped_results_path("eval_compare", ext=".json", results_dir=compare_dir)
+                write_json_atomic(out_path, report)
 
-    model_summary_paths: Dict[str, Dict[str, str]] = {}
-    compare_base = os.path.basename(out_path)
-    compare_name, _ = os.path.splitext(compare_base)
-    compare_ts = compare_name.replace("eval_compare_", "")
+        model_summary_paths: Dict[str, Dict[str, str]] = {}
+        compare_base = os.path.basename(out_path)
+        compare_name, _ = os.path.splitext(compare_base)
+        compare_ts = compare_name.replace("eval_compare_", "")
 
-    if structured_output and experiment_root:
-        for model_name in args.models:
-            model_root = build_model_root(experiment_root, model_name)
-            eval_dir = ensure_dir(os.path.join(model_root, "eval"))
-            summary_path = os.path.join(eval_dir, f"eval_summary_{compare_ts}.json")
-            episodes_path = os.path.join(eval_dir, f"eval_episodes_{compare_ts}.json")
+        if structured_output and experiment_root:
+            for model_name in args.models:
+                model_root = build_model_root(experiment_root, model_name)
+                eval_dir = ensure_dir(os.path.join(model_root, "eval"))
+                summary_path = os.path.join(eval_dir, f"eval_summary_{compare_ts}.json")
+                episodes_path = os.path.join(eval_dir, f"eval_episodes_{compare_ts}.json")
 
-            model_extract = _build_model_extract(
-                model_name=model_name,
+                model_extract = _build_model_extract(
+                    model_name=model_name,
+                    experiment_id=experiment_id,
+                    source_compare_report=out_path,
+                    aggregate=aggregate_by_model[model_name],
+                    episodes=report["per_model"][model_name],
+                    metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
+                )
+                write_json_atomic(summary_path, model_extract)
+                write_json_atomic(episodes_path, {
+                    "model": model_name,
+                    "experiment_id": experiment_id,
+                    "source_compare_report": out_path,
+                    "episodes": report["per_model"][model_name],
+                })
+                model_summary_paths[model_name] = {
+                    "summary": summary_path,
+                    "episodes": episodes_path,
+                }
+
+            report["model_eval_outputs"] = model_summary_paths
+            write_json_atomic(out_path, report)
+
+            _update_experiment_manifest_for_eval(
+                experiment_root=experiment_root,
                 experiment_id=experiment_id,
-                source_compare_report=out_path,
-                aggregate=aggregate_by_model[model_name],
-                episodes=report["per_model"][model_name],
-                metrics_config=model_metrics_configs.get(model_name, report["metrics_config"]),
+                config_path=args.config,
+                memory_path=config["memory_path"],
+                few_shot_num=int(few_shot_num),
+                simulation_duration=int(resolved_simulation_duration),
+                compare_report_path=out_path,
+                model_summaries=model_summary_paths,
+                model_run_outputs=model_run_outputs if save_run_artifacts else None,
             )
-            write_json_atomic(summary_path, model_extract)
-            write_json_atomic(episodes_path, {
-                "model": model_name,
-                "experiment_id": experiment_id,
-                "source_compare_report": out_path,
-                "episodes": report["per_model"][model_name],
-            })
-            model_summary_paths[model_name] = {
-                "summary": summary_path,
-                "episodes": episodes_path,
-            }
 
-        report["model_eval_outputs"] = model_summary_paths
-        write_json_atomic(out_path, report)
+        if user_out_path and user_out_path != out_path:
+            write_json_atomic(user_out_path, report)
 
-        _update_experiment_manifest_for_eval(
-            experiment_root=experiment_root,
-            experiment_id=experiment_id,
-            config_path=args.config,
-            memory_path=config["memory_path"],
-            few_shot_num=int(few_shot_num),
-            simulation_duration=int(config["simulation_duration"]),
-            compare_report_path=out_path,
-            model_summaries=model_summary_paths,
-            model_run_outputs=model_run_outputs if save_run_artifacts else None,
-        )
-
-    print("\n[bold green]Aggregate Summary[/bold green]")
-    for row in report["aggregates"]:
-        summary = (
-            f"- {row['model']}: crashes={row['crashes']}/{row['episodes']} "
-            f"(rate={row['crash_rate']}), no_collision_rate={row['no_collision_rate']}, "
-            f"avg_steps={row['avg_steps']}, strict_format_rate={row['response_strict_format_rate']}, "
-            f"ttc_danger_rate={row['ttc_danger_rate_mean']}, headway_violation_rate={row['headway_violation_rate_mean']}, "
-            f"rear_ttc_danger_rate={row.get('rear_ttc_danger_rate_mean')}, "
-            f"low_speed_blocking_rate={row.get('low_speed_blocking_rate_mean')}, "
-            f"decision_timeout_rate={row.get('decision_timeout_rate_mean')}, "
-            f"native_timeout_rate={row.get('ollama_native_timeout_rate_mean')}, "
-            f"fallback_action_rate={row.get('fallback_action_rate_mean')}, "
-            f"avg_episode_runtime_sec={row['avg_episode_runtime_sec']}"
-        )
-        if row.get("task_completion_rate") is not None:
-            summary += (
-                f", task_completion_rate={row.get('task_completion_rate')}, "
-                f"ttc_score_mean={row.get('ttc_score_mean')}, "
-                f"time_efficiency_score_mean={row.get('time_efficiency_score_mean')}, "
-                f"driving_score={row.get('driving_score')}"
+        print("\n[bold green]Aggregate Summary[/bold green]")
+        for row in report["aggregates"]:
+            summary = (
+                f"- {row['model']}: crashes={row['crashes']}/{row['episodes']} "
+                f"(rate={row['crash_rate']}), no_collision_rate={row['no_collision_rate']}, "
+                f"avg_steps={row['avg_steps']}, strict_format_rate={row['response_strict_format_rate']}, "
+                f"ttc_danger_rate={row['ttc_danger_rate_mean']}, headway_violation_rate={row['headway_violation_rate_mean']}, "
+                f"rear_ttc_danger_rate={row.get('rear_ttc_danger_rate_mean')}, "
+                f"low_speed_blocking_rate={row.get('low_speed_blocking_rate_mean')}, "
+                f"stop_episode_rate={row.get('stop_episode_rate')}, "
+                f"decision_timeout_rate={row.get('decision_timeout_rate_mean')}, "
+                f"native_timeout_rate={row.get('ollama_native_timeout_rate_mean')}, "
+                f"fallback_action_rate={row.get('fallback_action_rate_mean')}, "
+                f"avg_episode_runtime_sec={row['avg_episode_runtime_sec']}"
             )
-        print(summary)
-        if row.get("timeout_collapse_detected"):
-            print(
-                "[bold red]  ! Timeout-collapse detected[/bold red]: "
-                f"{row.get('timeout_collapse_reason')} | "
-                "comparison is dominated by fallback action 4. "
-                "Check OLLAMA_USE_NATIVE_CHAT, few_shot_num, and eval streaming settings."
-            )
-    print(f"\nSaved report: [bold]{out_path}[/bold]")
-    if user_out_path and user_out_path != out_path:
-        print(f"Saved user-requested output copy: [bold]{user_out_path}[/bold]")
+            if row.get("task_completion_rate") is not None:
+                driving_score_value = row.get("driving_score_v2")
+                driving_score_label = "driving_score_v2"
+                if driving_score_value is None:
+                    driving_score_value = row.get("driving_score")
+                    driving_score_label = "driving_score"
+                summary += (
+                    f", task_completion_rate={row.get('task_completion_rate')}, "
+                    f"ttc_score_mean={row.get('ttc_score_mean')}, "
+                    f"time_efficiency_score_mean={row.get('time_efficiency_score_mean')}, "
+                    f"{driving_score_label}={driving_score_value}"
+                )
+                if row.get("benchmark_result_valid") is not None:
+                    summary += (
+                        f", benchmark_result_valid={row.get('benchmark_result_valid')}"
+                    )
+            if row.get("ollama_preflight_ok") is False:
+                summary += ", ollama_preflight_ok=False"
+            print(summary)
+            if row.get("timeout_collapse_detected"):
+                print(
+                    "[bold red]  ! Timeout-collapse detected[/bold red]: "
+                    f"{row.get('timeout_collapse_reason')} | "
+                    "comparison is dominated by fallback action 4. "
+                    "Check OLLAMA_USE_NATIVE_CHAT, few_shot_num, and eval streaming settings."
+                )
+            if row.get("benchmark_result_valid") is False:
+                print(
+                    "[bold red]  ! Benchmark result invalid[/bold red]: "
+                    f"{row.get('benchmark_result_invalid_reason')}. "
+                    "Do not compare this benchmark run against valid benchmark results."
+                )
+        if report.get("ollama_preflight_failed_models"):
+            print("\n[yellow]Preflight warnings[/yellow]")
+            for item in report["ollama_preflight_failed_models"]:
+                print(
+                    f"- model={item.get('model')} transport={item.get('transport')} "
+                    f"error={item.get('error')}"
+                )
+        print(f"\nSaved report: [bold]{out_path}[/bold]")
+        if user_out_path and user_out_path != out_path:
+            print(f"Saved user-requested output copy: [bold]{user_out_path}[/bold]")
+
+    if monitor is not None:
+        monitor.close()
 
 
 if __name__ == "__main__":

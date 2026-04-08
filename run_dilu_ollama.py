@@ -4,7 +4,6 @@ import copy
 from contextlib import nullcontext
 import random
 import numpy as np
-import yaml
 import os
 import json
 import re
@@ -32,6 +31,7 @@ from dilu.driver_agent.vectorStore import DrivingMemory
 from dilu.driver_agent.reflectionAgent import ReflectionAgent
 from dilu.runtime import (
     configure_runtime_env,
+    load_runtime_config,
     resolve_model_policy,
     apply_model_policy_to_env,
     build_decision_timeout_penalty_state,
@@ -693,8 +693,7 @@ if __name__ == '__main__':
 
     quiet_override = True if args.quiet else (False if args.no_quiet else None)
     config_path = args.config
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    config = load_runtime_config(config_path)
     progress_override = True if args.progress else (False if args.no_progress else None)
     resolved_runtime_progress_mode = _resolve_progress_mode(config, progress_override, mode="runtime")
     runtime_progress_enabled = bool(resolved_runtime_progress_mode and _is_interactive_output())

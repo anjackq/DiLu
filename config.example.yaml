@@ -1,122 +1,143 @@
-############ Large language model config ############
-OPENAI_API_TYPE: 'gemini' # 'openai' or 'azure' or 'ollama' or 'gemini'
+############ Full runtime config reference ############
+# `config.yaml` is the lean active Ollama/eval config checked into the repo.
+# This file is the fuller option catalog with provider placeholders, optional
+# overrides, and legacy-compatible keys that are still supported by the code.
+
+############ Provider selection ############
+OPENAI_API_TYPE: 'ollama' # openai | azure | ollama | gemini
 
 # OpenAI settings
-OPENAI_KEY: 'ollama'
+OPENAI_KEY: ''
 OPENAI_CHAT_MODEL: null
 OPENAI_REFLECTION_MODEL: null
 
 # Azure OpenAI settings
-AZURE_API_BASE: # https://xxxxxxx.openai.azure.com/
+AZURE_API_BASE: null # https://xxxxxxx.openai.azure.com/
 AZURE_API_VERSION: "2023-07-01-preview"
-AZURE_API_KEY: #'xxxxxxx'
-AZURE_CHAT_DEPLOY_NAME: # chat model deployment name
-AZURE_EMBED_DEPLOY_NAME: # text embed model deployment name
+AZURE_API_KEY: null
+AZURE_CHAT_DEPLOY_NAME: null
+AZURE_EMBED_DEPLOY_NAME: null
 
-############# Gemini API settings ###############
-GEMINI_API_KEY: '' # AI Studio key
+# Gemini settings
+GEMINI_API_KEY: ''
 GEMINI_CHAT_MODEL: 'gemini-2.0-flash'
 GEMINI_REFLECTION_MODEL: null
 
-############# Local model / Ollama config ###############
+# Local model / Ollama settings
 OLLAMA_API_BASE: 'http://localhost:11434/v1'
-OLLAMA_CHAT_MODEL: 'deepseek-r1:14b'
-OLLAMA_REFLECTION_MODEL: 'deepseek-r1:14b'
+OLLAMA_CHAT_MODEL: 'qwen3.5:0.8b'
+OLLAMA_REFLECTION_MODEL: null
 OLLAMA_EMBED_MODEL: 'qwen3-embedding:8b'
 OLLAMA_API_KEY: 'ollama'
-# Driver agent reasoning switch for native Ollama chat.
 # Allowed: auto | think | no_think
 OLLAMA_THINK_MODE: 'auto'
-# Use OpenAI-compatible /v1 by default for eval stability on smaller local models.
 OLLAMA_USE_NATIVE_CHAT: false
-# Optional timeout for native /api/chat requests (seconds).
 OLLAMA_NATIVE_CHAT_TIMEOUT_SEC: 60
 
-############### DiLu settings ############
-reflection_module: True # True or False
-reflection_interactive: True # If False, disable Y/N terminal prompts in reflection flow
-reflection_auto_add: False # If True, auto-commit reflection memories without prompts
-reflection_add_every_n: 5 # In non-collision runs, add one memory every N frames (uses i % N == 1)
-few_shot_num: 1 # Keep retrieval light for smaller local models during eval
-episodes_num: 3
-memory_path: 'memories/qwen3_embed_8b'
+############ DiLu settings ############
+reflection_module: false
+reflection_interactive: true
+reflection_auto_add: false
+reflection_add_every_n: 5
+few_shot_num: 1
+episodes_num: 5
+memory_path: 'memories/20_mem'
 
-# Structured results layout (recommended default)
-results_root: 'results/experiments'
-experiment_id: null # null -> auto timestamped experiment id
-run_id: null # null -> auto run_<timestamp>
+############ Structured results ############
+results_root: 'results/'
+experiment_id: null
+run_id: null
 
 # Legacy direct output override (optional)
 result_folder_override: null
-result_folder: 'results/deepseek-r1_14b' # backward-compat fallback when results_root is unset
+result_folder: null
 
-############ Highway-env config ############
-simulation_duration: 20
-vehicle_count: 15
-other_vehicle_type: "highway_env.vehicle.behavior.IDMVehicle"
-vehicles_density: 2.0
-
-# Global simulation environment resolver (used by RL + LLM runtime/eval + collection).
+############ Simulation environment resolver ############
 sim_env_id: "highway-fast-v0"
 sim_use_native_env_defaults: true
+sim_action_target_speeds: [0, 5, 10, 15, 20, 25, 30]
 
-# Deprecated aliases (transition only; lower precedence than sim_* keys).
-rl_env_id: "highway-fast-v0"
-rl_use_native_env_defaults: true
+# Optional explicit env overrides. These only matter when you want to override
+# the native env preset loaded by `sim_env_id`.
+simulation_duration: 30
+vehicle_count: 20
+other_vehicle_type: "highway_env.vehicle.behavior.IDMVehicle"
+vehicles_density: 1.0
+lanes_count: 3
+simulation_frequency: 5
+policy_frequency: 1
+collision_reward: -1.0
+high_speed_reward: 0.4
+right_lane_reward: 0.1
+lane_change_reward: 0.0
+reward_speed_range: [20, 30]
+normalize_reward: true
+offroad_terminal: false
+ego_spacing: 1.5
+scaling: 5
 
-############ Evaluation metrics defaults ############
+# Deprecated aliases (still read, but prefer sim_* keys above).
+rl_env_id: null
+rl_use_native_env_defaults: null
+
+############ Evaluation metrics ############
 metrics_ttc_threshold_sec: 2.0
 metrics_headway_threshold_m: 15.0
-metrics_flapping_mode: "accel_decel"
+metrics_rear_ttc_threshold_sec: 2.5
+metrics_rear_headway_threshold_m: 12.0
+metrics_low_speed_blocking_threshold_mps: 8.5
+metrics_blocking_front_gap_safe_m: 25.0
+metrics_blocking_front_ttc_safe_sec: 4.0
+metrics_stop_threshold_mps: 0.5
+metrics_near_stop_threshold_mps: 2.0
 
-############ Evaluation runtime guardrails ############
-# Quiet mode controls (step logs only):
-# - quiet_mode: global default
-# - eval_quiet_mode/runtime_quiet_mode: mode-specific override (null -> inherit global)
+############ Evaluation / runtime guardrails ############
 quiet_mode: false
 eval_quiet_mode: null
 runtime_quiet_mode: null
 
-# Progress bar controls:
-# - progress_bar: global default
-# - eval_progress_bar/runtime_progress_bar: mode-specific override (null -> inherit global)
 progress_bar: true
 eval_progress_bar: null
 runtime_progress_bar: null
-# Reply preview while progress bars are active.
-# Allowed: off | compact | full
 progress_reply_mode: off
 eval_progress_reply_mode: null
 runtime_progress_reply_mode: null
 
 eval_decision_timeout_sec: 60
-eval_decision_max_output_tokens: 512 # Runtime output control (not policy-managed)
-eval_disable_streaming: true # Runtime output control (not policy-managed)
-eval_disable_checker_llm: true # Runtime output control (not policy-managed)
+runtime_decision_timeout_sec: 60
+eval_decision_max_output_tokens: 512
+eval_disable_streaming: true
+eval_disable_checker_llm: true
 eval_performance_mode: default # default | fast
-eval_ollama_preflight_enabled: true # Fail fast if Ollama cannot answer a tiny probe request.
-eval_ollama_preflight_timeout_sec: 15 # Seconds for the preflight probe before aborting eval.
+eval_ollama_preflight_enabled: true
+eval_ollama_preflight_timeout_sec: 15
+eval_measurement_hard_preflight_policy: skip_model # warn_run | skip_model | abort_run
 eval_slow_decision_threshold_sec: 5.0
 runtime_slow_decision_threshold_sec: 5.0
 eval_save_run_artifacts: false
-eval_run_id: null # null -> auto eval_run_<timestamp> when artifact capture is enabled
+eval_run_id: null
 
-############ Adaptive timeout-halving penalty (decision timeout only) ############
-# This penalty only changes decision timeout and does not change output behavior controls.
+############ Eval timeout ladder defaults ############
+eval_timeout_policy_mode: laddered
+eval_timeout_ladder_sec: [15, 20, 30]
+eval_timeout_recovery_successes: 3
+eval_timeout_early_stop_enabled: true
+eval_timeout_early_stop_min_decisions: 5
+eval_timeout_early_stop_consecutive_timeout_fallbacks: 3
+eval_timeout_early_stop_collapse_rate_threshold: 0.8
+eval_timeout_early_stop_require_max_timeout_level: true
+eval_timeout_model_quarantine_after_collapses: 2
+
+############ Legacy adaptive timeout penalty ############
+# Used by runtime mode, and by eval only if you switch eval_timeout_policy_mode
+# away from `laddered`.
 adaptive_timeout_penalty_enabled: true
 adaptive_timeout_halving_factor: 0.5
 adaptive_timeout_min_sec: 4.0
 adaptive_timeout_trigger_consecutive_slow: 2
 
-# Optional shared model-aware timeout overrides (used by both evaluate_models_ollama.py and run_dilu_ollama.py).
-# Timeout-only policy mode:
-# - Only `decision_timeout_sec` is honored in policy overrides.
-# - Output-affecting policy fields are ignored with warnings.
-# Precedence: CLI timeout override > model_policy_overrides > eval_model_overrides (eval only) > defaults.
-# Matching: exact model name first, then wildcard/prefix entries.
-model_policy_use_builtin_presets: false # Deprecated in timeout-only mode (ignored)
+############ Model-specific timeout overrides ############
 model_policy_overrides:
-  # Timeout-only examples.
   'gemini*pro*':
     decision_timeout_sec: 45
   'gemini*flash*':
@@ -126,11 +147,7 @@ model_policy_overrides:
   'qwen3.5:2b':
     decision_timeout_sec: 10
 
-# Legacy eval-only per-model overrides (kept for backward compatibility).
-# Timeout-only policy mode:
-# - only `decision_timeout_sec` is honored.
-# - all other policy fields are deprecated and ignored with warnings.
-# Matching: exact model name first, then wildcard/prefix entries.
+# Legacy eval-only per-model overrides (still supported).
 eval_model_overrides:
   'qwen3.5:0.8b':
     decision_timeout_sec: 8

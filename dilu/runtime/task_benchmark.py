@@ -4,6 +4,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import gymnasium as gym
 import numpy as np
 
 
@@ -15,12 +16,47 @@ BENCHMARK_OVERALL_WEIGHTS = {
     "speed_variance": 0.3,
     "time_efficiency": 0.2,
 }
+BENCHMARK_SCORING_POLICY_VERSION = "v2_behavior_aware"
+BENCHMARK_RECOMMENDED_HEADLINE_METRIC = "driving_score_v2"
+BENCHMARK_BOOTSTRAP_ITERATIONS = 2000
+BENCHMARK_BOOTSTRAP_SEED = 20260326
+BENCHMARK_V2_ASSERTIVE_CATEGORIES = (
+    "follow_gap_decrease",
+    "lane_change_left",
+    "lane_change_right",
+    "overtake_left",
+    "overtake_right",
+    "speed_increase",
+)
+BENCHMARK_V2_DEFENSIVE_CATEGORIES = (
+    "follow_gap_increase",
+    "speed_decrease",
+)
+BENCHMARK_V2_CONSERVATIVE_PROFILES = {
+    "assertive": {
+        "stop_rate": {"weight": 0.40, "grace": 0.02},
+        "near_stop_rate": {"weight": 0.20, "grace": 0.05},
+        "low_speed_blocking_rate": {"weight": 0.40, "grace": 0.05},
+    },
+    "defensive": {
+        "stop_rate": {"weight": 0.20, "grace": 0.10},
+        "near_stop_rate": {"weight": 0.10, "grace": 0.20},
+        "low_speed_blocking_rate": {"weight": 0.70, "grace": 0.10},
+    },
+}
+BENCHMARK_V2_RUNTIME_PENALTY = {
+    "decision_timeout_rate": {"weight": 0.40},
+    "fallback_action_rate": {"weight": 0.60},
+    "grace": 0.01,
+    "cap": 0.25,
+}
 
 _ENV_OVERRIDE_ALIASES = {
     "simulation_duration": "duration",
     "vehicle_count": "vehicles_count",
     "other_vehicle_type": "other_vehicles_type",
 }
+_ALLOWED_DIFFICULTIES = {"easy", "medium", "hard"}
 
 
 def _repo_root() -> str:
@@ -99,6 +135,14 @@ def load_benchmark_case_set(identifier: str) -> Dict[str, Any]:
             env_overrides = _deep_update(env_overrides, dict(case["env_overrides"]))
         env_overrides = _normalize_env_overrides(env_overrides)
 
+        difficulty = str(case.get("difficulty") or defaults.get("difficulty") or "medium").strip().lower()
+        if difficulty not in _ALLOWED_DIFFICULTIES:
+            raise ValueError(
+                f"Benchmark case `{case_id}` has invalid difficulty `{difficulty}`. "
+                f"Allowed: {sorted(_ALLOWED_DIFFICULTIES)}"
+            )
+        case_group = str(case.get("case_group") or defaults.get("case_group") or category).strip() or category
+
         normalized_case = {
             "case_id": case_id,
             "category": category,
@@ -108,6 +152,8 @@ def load_benchmark_case_set(identifier: str) -> Dict[str, Any]:
             "success_criteria": success_criteria,
             "env_overrides": env_overrides,
             "tags": [str(tag) for tag in (case.get("tags") or [])],
+            "difficulty": difficulty,
+            "case_group": case_group,
         }
         normalized_cases.append(normalized_case)
 
@@ -167,8 +213,107 @@ def benchmark_metric_config() -> Dict[str, Any]:
         "ttc_safe_threshold_sec": BENCHMARK_TTC_SAFE_THRESHOLD_SEC,
         "speed_std_safe_mps": BENCHMARK_SPEED_STD_SAFE_MPS,
         "overall_weights": dict(BENCHMARK_OVERALL_WEIGHTS),
-        "driving_score_formula": "0 if crashed else 0.5*completion_rate + 0.5*overall_score",
+        "driving_score_formula": "0 if crashed else completion_rate * overall_score",
+        "benchmark_scoring_policy_version": BENCHMARK_SCORING_POLICY_VERSION,
+        "recommended_headline_metric": BENCHMARK_RECOMMENDED_HEADLINE_METRIC,
+        "behavior_aware_v2": {
+            "formula": "overall_score_v2 = overall_score * (1 - conservative_penalty_severity_v2) * (1 - runtime_penalty_severity_v2); driving_score_v2 = driving_score * (1 - conservative_penalty_severity_v2) * (1 - runtime_penalty_severity_v2)",
+            "category_groups": {
+                "assertive": list(BENCHMARK_V2_ASSERTIVE_CATEGORIES),
+                "defensive": list(BENCHMARK_V2_DEFENSIVE_CATEGORIES),
+            },
+            "conservative_profiles": copy.deepcopy(BENCHMARK_V2_CONSERVATIVE_PROFILES),
+            "runtime_penalty": copy.deepcopy(BENCHMARK_V2_RUNTIME_PENALTY),
+        },
+        "bootstrap_iterations": int(BENCHMARK_BOOTSTRAP_ITERATIONS),
+        "bootstrap_seed": int(BENCHMARK_BOOTSTRAP_SEED),
     }
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _norm_with_grace(rate: Any, grace: float) -> float:
+    return _clamp01((float(rate or 0.0) - float(grace)) / max(1e-9, 1.0 - float(grace)))
+
+
+def _runtime_norm(rate: Any) -> float:
+    grace = float(BENCHMARK_V2_RUNTIME_PENALTY["grace"])
+    cap = float(BENCHMARK_V2_RUNTIME_PENALTY["cap"])
+    return _clamp01((float(rate or 0.0) - grace) / max(1e-9, cap - grace))
+
+
+def _conservative_profile_name(category: Any) -> str:
+    category_name = str(category or "").strip()
+    if category_name in BENCHMARK_V2_DEFENSIVE_CATEGORIES:
+        return "defensive"
+    return "assertive"
+
+
+def compute_behavior_aware_penalty_v2(
+    *,
+    category: Any,
+    stop_rate: Any,
+    near_stop_rate: Any,
+    low_speed_blocking_rate: Any,
+    decision_timeout_rate: Any,
+    fallback_action_rate: Any,
+) -> Dict[str, Any]:
+    profile_name = _conservative_profile_name(category)
+    profile = BENCHMARK_V2_CONSERVATIVE_PROFILES[profile_name]
+
+    conservative_penalty_severity_v2 = 0.0
+    for metric_name, metric_cfg in profile.items():
+        conservative_penalty_severity_v2 += float(metric_cfg["weight"]) * _norm_with_grace(
+            {
+                "stop_rate": stop_rate,
+                "near_stop_rate": near_stop_rate,
+                "low_speed_blocking_rate": low_speed_blocking_rate,
+            }[metric_name],
+            float(metric_cfg["grace"]),
+        )
+
+    runtime_penalty_severity_v2 = (
+        float(BENCHMARK_V2_RUNTIME_PENALTY["decision_timeout_rate"]["weight"]) * _runtime_norm(decision_timeout_rate)
+        + float(BENCHMARK_V2_RUNTIME_PENALTY["fallback_action_rate"]["weight"]) * _runtime_norm(fallback_action_rate)
+    )
+
+    conservative_penalty_severity_v2 = _clamp01(conservative_penalty_severity_v2)
+    runtime_penalty_severity_v2 = _clamp01(runtime_penalty_severity_v2)
+    conservative_factor_v2 = 1.0 - conservative_penalty_severity_v2
+    runtime_factor_v2 = 1.0 - runtime_penalty_severity_v2
+    behavior_penalty_factor_v2 = conservative_factor_v2 * runtime_factor_v2
+
+    return {
+        "behavior_penalty_profile_v2": profile_name,
+        "conservative_penalty_severity_v2": round(conservative_penalty_severity_v2, 4),
+        "runtime_penalty_severity_v2": round(runtime_penalty_severity_v2, 4),
+        "behavior_penalty_factor_v2": round(behavior_penalty_factor_v2, 4),
+    }
+
+
+def augment_behavior_aware_benchmark_episode(episode: Dict[str, Any]) -> Dict[str, Any]:
+    if "task_completed" not in episode:
+        return dict(episode)
+
+    scored = dict(episode)
+    penalty_metrics = compute_behavior_aware_penalty_v2(
+        category=scored.get("category"),
+        stop_rate=scored.get("stop_rate"),
+        near_stop_rate=scored.get("near_stop_rate"),
+        low_speed_blocking_rate=scored.get("low_speed_blocking_rate"),
+        decision_timeout_rate=scored.get("decision_timeout_rate"),
+        fallback_action_rate=scored.get("fallback_action_rate"),
+    )
+    behavior_penalty_factor_v2 = float(penalty_metrics["behavior_penalty_factor_v2"])
+    overall_score = float(scored.get("overall_score", 0.0) or 0.0)
+    driving_score = float(scored.get("driving_score", 0.0) or 0.0)
+
+    scored.update(penalty_metrics)
+    scored["overall_score_v2"] = round(overall_score * behavior_penalty_factor_v2, 4)
+    scored["driving_score_v2"] = round(driving_score * behavior_penalty_factor_v2, 4)
+    return scored
 
 
 def _lane_rank(vehicle) -> Optional[int]:
@@ -210,6 +355,388 @@ def _resolve_direction_offset(criteria: Dict[str, Any]) -> int:
     return 0
 
 
+def inspect_benchmark_initial_state(env) -> Dict[str, Any]:
+    uenv = env.unwrapped
+    ego = getattr(uenv, "vehicle", None)
+    road = getattr(uenv, "road", None)
+    available_actions = list(getattr(uenv, "get_available_actions", lambda: [])())
+    front_vehicle = None
+    front_gap_m = None
+    front_is_ahead = False
+    if ego is not None and road is not None:
+        front_vehicle, _ = road.neighbour_vehicles(ego, ego.lane_index)
+        if front_vehicle is not None:
+            front_gap_m = float(np.linalg.norm(ego.position - front_vehicle.position))
+            ego_x = _vehicle_x(ego)
+            front_x = _vehicle_x(front_vehicle)
+            front_is_ahead = bool(
+                ego_x is not None and front_x is not None and front_x > ego_x
+            )
+    return {
+        "initial_lane_rank": _lane_rank(ego),
+        "initial_speed_mps": float(getattr(ego, "speed", 0.0) or 0.0) if ego is not None else None,
+        "initial_front_vehicle_exists": bool(front_vehicle is not None),
+        "initial_front_gap_m": front_gap_m,
+        "initial_front_vehicle_is_ahead": bool(front_is_ahead),
+        "available_actions": available_actions,
+        "can_change_left": 0 in available_actions,
+        "can_change_right": 2 in available_actions,
+    }
+
+
+def validate_benchmark_case(case: Dict[str, Any], initial_state: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    criteria = dict(case.get("success_criteria") or {})
+    criteria_type = str(criteria.get("type") or "").strip().lower()
+
+    if criteria_type == "speed_band":
+        speed = initial_state.get("initial_speed_mps")
+        min_speed = float(criteria.get("min_speed_mps", 0.0))
+        max_speed = float(criteria.get("max_speed_mps", 999.0))
+        if speed is None:
+            reasons.append("missing_initial_speed")
+        elif min_speed <= float(speed) <= max_speed:
+            reasons.append("initial_speed_inside_target_band")
+
+    elif criteria_type == "front_gap_band":
+        if not initial_state.get("initial_front_vehicle_exists"):
+            reasons.append("missing_initial_front_vehicle")
+        else:
+            front_gap_m = initial_state.get("initial_front_gap_m")
+            min_gap = float(criteria.get("min_gap_m", 0.0))
+            max_gap = float(criteria.get("max_gap_m", 1e9))
+            if front_gap_m is None:
+                reasons.append("missing_initial_front_gap")
+            elif min_gap <= float(front_gap_m) <= max_gap:
+                reasons.append("initial_front_gap_inside_target_band")
+
+    elif criteria_type == "lane_change":
+        lane_rank = initial_state.get("initial_lane_rank")
+        target_offset = _resolve_direction_offset(criteria)
+        if target_offset == 0:
+            reasons.append("invalid_target_lane_offset")
+        elif target_offset < 0 and not initial_state.get("can_change_left"):
+            reasons.append("target_left_lane_unavailable")
+        elif target_offset > 0 and not initial_state.get("can_change_right"):
+            reasons.append("target_right_lane_unavailable")
+        elif lane_rank is None:
+            reasons.append("missing_initial_lane_rank")
+        else:
+            target_lane_rank = int(lane_rank) + int(target_offset)
+            if target_lane_rank == int(lane_rank):
+                reasons.append("ego_already_in_target_lane")
+
+    elif criteria_type == "overtake":
+        target_offset = _resolve_direction_offset(criteria)
+        if target_offset == 0:
+            reasons.append("invalid_target_lane_offset")
+        elif target_offset < 0 and not initial_state.get("can_change_left"):
+            reasons.append("target_left_lane_unavailable")
+        elif target_offset > 0 and not initial_state.get("can_change_right"):
+            reasons.append("target_right_lane_unavailable")
+        if not initial_state.get("initial_front_vehicle_exists"):
+            reasons.append("missing_initial_front_vehicle")
+        elif not initial_state.get("initial_front_vehicle_is_ahead"):
+            reasons.append("initial_front_vehicle_not_ahead")
+
+    else:
+        reasons.append(f"unsupported_success_criteria_type:{criteria_type or 'missing'}")
+
+    return reasons
+
+
+def validate_benchmark_case_set(
+    case_set: Dict[str, Any],
+    base_env_config_map: Dict[str, Dict[str, Any]],
+    env_type: str,
+) -> Dict[str, Any]:
+    invalid_cases: List[Dict[str, Any]] = []
+    valid_cases: List[Dict[str, Any]] = []
+
+    for case in case_set.get("cases", []):
+        case_env_config_map, _ = build_case_env_config(base_env_config_map, env_type, case)
+        env = gym.make(env_type, render_mode="rgb_array")
+        initial_state: Dict[str, Any] = {}
+        reasons: List[str] = []
+        try:
+            env.unwrapped.configure(case_env_config_map[env_type])
+            env.reset(seed=int(case["seed"]))
+            initial_state = inspect_benchmark_initial_state(env)
+            reasons = validate_benchmark_case(case, initial_state)
+        finally:
+            env.close()
+
+        item = {
+            "case_id": case["case_id"],
+            "category": case["category"],
+            "seed": int(case["seed"]),
+            "difficulty": case.get("difficulty"),
+            "case_group": case.get("case_group"),
+            "reasons": reasons,
+            "initial_state": initial_state,
+        }
+        if reasons:
+            invalid_cases.append(item)
+        else:
+            valid_cases.append(item)
+
+    summary = {
+        "benchmark_name": str(case_set.get("benchmark_name") or ""),
+        "total_cases": len(case_set.get("cases", [])),
+        "valid_case_count": len(valid_cases),
+        "invalid_case_count": len(invalid_cases),
+        "valid_categories": sorted({item["category"] for item in valid_cases}),
+        "invalid_categories": sorted({item["category"] for item in invalid_cases}),
+        "case_group_count": len({str(case.get("case_group") or case.get("category") or "") for case in case_set.get("cases", [])}),
+    }
+    return {
+        "passed": len(invalid_cases) == 0,
+        "invalid_cases": invalid_cases,
+        "valid_cases": valid_cases,
+        "summary": summary,
+    }
+
+
+def bootstrap_ci95(
+    values: List[float],
+    *,
+    iterations: int = BENCHMARK_BOOTSTRAP_ITERATIONS,
+    seed: int = BENCHMARK_BOOTSTRAP_SEED,
+) -> Optional[List[float]]:
+    if not values:
+        return None
+    values_arr = np.array(list(values), dtype=float)
+    if values_arr.size == 1:
+        only = round(float(values_arr[0]), 4)
+        return [only, only]
+    rng = np.random.default_rng(int(seed))
+    means = []
+    for _ in range(max(1, int(iterations))):
+        sample = rng.choice(values_arr, size=values_arr.size, replace=True)
+        means.append(float(np.mean(sample)))
+    lower, upper = np.percentile(np.array(means, dtype=float), [2.5, 97.5])
+    return [round(float(lower), 4), round(float(upper), 4)]
+
+
+def compute_benchmark_case_scores(
+    *,
+    task_completed: bool,
+    crashed: bool,
+    min_positive_ttc_sec: Optional[float],
+    speed_history: List[float],
+    completion_time_sec: Optional[float],
+    time_limit_sec: float,
+) -> Dict[str, Any]:
+    completion_rate = 1.0 if bool(task_completed) else 0.0
+    if crashed:
+        ttc_score = 0.0
+    elif min_positive_ttc_sec is None:
+        ttc_score = 1.0
+    else:
+        ttc_score = max(
+            0.0,
+            min(1.0, float(min_positive_ttc_sec) / BENCHMARK_TTC_SAFE_THRESHOLD_SEC),
+        )
+
+    if len(speed_history) <= 1:
+        speed_std_mps = 0.0
+    else:
+        speed_std_mps = float(np.std(np.array(speed_history, dtype=float)))
+    speed_variance_score = max(
+        0.0,
+        min(1.0, 1.0 - (speed_std_mps / BENCHMARK_SPEED_STD_SAFE_MPS)),
+    )
+
+    if completion_time_sec is None or float(time_limit_sec) <= 0:
+        time_efficiency_score = 0.0
+    else:
+        time_efficiency_score = max(
+            0.0,
+            min(1.0, 1.0 - (float(completion_time_sec) / float(time_limit_sec))),
+        )
+
+    overall_score = (
+        BENCHMARK_OVERALL_WEIGHTS["ttc"] * ttc_score
+        + BENCHMARK_OVERALL_WEIGHTS["speed_variance"] * speed_variance_score
+        + BENCHMARK_OVERALL_WEIGHTS["time_efficiency"] * time_efficiency_score
+    )
+    driving_score = 0.0 if crashed else (completion_rate * overall_score)
+    return {
+        "completion_rate": round(completion_rate, 4),
+        "ttc_score": round(ttc_score, 4),
+        "speed_std_mps": round(speed_std_mps, 4),
+        "speed_variance_score": round(speed_variance_score, 4),
+        "time_efficiency_score": round(time_efficiency_score, 4),
+        "overall_score": round(overall_score, 4),
+        "driving_score": round(driving_score, 4),
+    }
+
+
+def _mean_metric(episodes: List[Dict[str, Any]], key: str) -> float:
+    return float(sum(float(item.get(key, 0.0) or 0.0) for item in episodes) / max(len(episodes), 1))
+
+
+def _failure_reason_counts(episodes: List[Dict[str, Any]]) -> Dict[str, int]:
+    failure_reasons: Dict[str, int] = {}
+    for episode in episodes:
+        reason = str(episode.get("benchmark_failure_reason") or "").strip()
+        if reason:
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+    return failure_reasons
+
+
+def summarize_benchmark_episodes(episodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not episodes:
+        return {}
+
+    benchmark_total = len(episodes)
+    completion_values = [1.0 if episode.get("task_completed") else 0.0 for episode in episodes]
+    driving_values = [float(episode.get("driving_score", 0.0) or 0.0) for episode in episodes]
+    driving_v2_values = [
+        float(episode.get("driving_score_v2"))
+        for episode in episodes
+        if episode.get("driving_score_v2") is not None
+    ]
+    overall_v2_values = [
+        float(episode.get("overall_score_v2"))
+        for episode in episodes
+        if episode.get("overall_score_v2") is not None
+    ]
+    behavior_penalty_values = [
+        float(episode.get("behavior_penalty_factor_v2"))
+        for episode in episodes
+        if episode.get("behavior_penalty_factor_v2") is not None
+    ]
+    conservative_penalty_values = [
+        float(episode.get("conservative_penalty_severity_v2"))
+        for episode in episodes
+        if episode.get("conservative_penalty_severity_v2") is not None
+    ]
+    runtime_penalty_values = [
+        float(episode.get("runtime_penalty_severity_v2"))
+        for episode in episodes
+        if episode.get("runtime_penalty_severity_v2") is not None
+    ]
+
+    by_category: Dict[str, Dict[str, Any]] = {}
+    for category in sorted({str(episode.get("category") or "uncategorized") for episode in episodes}):
+        subset = [episode for episode in episodes if str(episode.get("category") or "uncategorized") == category]
+        category_summary = {
+            "benchmark_case_count": len(subset),
+            "task_completion_count": sum(1 for episode in subset if episode.get("task_completed")),
+            "task_completion_rate": round(sum(1 for episode in subset if episode.get("task_completed")) / max(len(subset), 1), 4),
+            "ttc_score_mean": round(_mean_metric(subset, "ttc_score"), 4),
+            "speed_variance_score_mean": round(_mean_metric(subset, "speed_variance_score"), 4),
+            "time_efficiency_score_mean": round(_mean_metric(subset, "time_efficiency_score"), 4),
+            "overall_score_mean": round(_mean_metric(subset, "overall_score"), 4),
+            "driving_score": round(_mean_metric(subset, "driving_score"), 4),
+            "benchmark_failure_reasons": _failure_reason_counts(subset),
+        }
+        category_driving_v2_values = [
+            float(episode.get("driving_score_v2"))
+            for episode in subset
+            if episode.get("driving_score_v2") is not None
+        ]
+        category_overall_v2_values = [
+            float(episode.get("overall_score_v2"))
+            for episode in subset
+            if episode.get("overall_score_v2") is not None
+        ]
+        category_behavior_penalty_values = [
+            float(episode.get("behavior_penalty_factor_v2"))
+            for episode in subset
+            if episode.get("behavior_penalty_factor_v2") is not None
+        ]
+        if category_driving_v2_values:
+            category_summary["driving_score_v2"] = round(
+                float(np.mean(np.array(category_driving_v2_values, dtype=float))),
+                4,
+            )
+        if category_overall_v2_values:
+            category_summary["overall_score_v2_mean"] = round(
+                float(np.mean(np.array(category_overall_v2_values, dtype=float))),
+                4,
+            )
+        if category_behavior_penalty_values:
+            category_summary["behavior_penalty_factor_v2_mean"] = round(
+                float(np.mean(np.array(category_behavior_penalty_values, dtype=float))),
+                4,
+            )
+        by_category[category] = category_summary
+
+    summary = {
+        "benchmark_case_count": benchmark_total,
+        "task_completion_count": int(sum(completion_values)),
+        "task_completion_rate": round(float(np.mean(np.array(completion_values, dtype=float))), 4),
+        "task_completion_rate_ci95": bootstrap_ci95(
+            completion_values,
+            iterations=BENCHMARK_BOOTSTRAP_ITERATIONS,
+            seed=BENCHMARK_BOOTSTRAP_SEED,
+        ),
+        "ttc_score_mean": round(_mean_metric(episodes, "ttc_score"), 4),
+        "speed_variance_score_mean": round(_mean_metric(episodes, "speed_variance_score"), 4),
+        "time_efficiency_score_mean": round(_mean_metric(episodes, "time_efficiency_score"), 4),
+        "overall_score_mean": round(_mean_metric(episodes, "overall_score"), 4),
+        "driving_score": round(float(np.mean(np.array(driving_values, dtype=float))), 4),
+        "driving_score_ci95": bootstrap_ci95(
+            driving_values,
+            iterations=BENCHMARK_BOOTSTRAP_ITERATIONS,
+            seed=BENCHMARK_BOOTSTRAP_SEED + 1,
+        ),
+        "benchmark_failure_reasons": _failure_reason_counts(episodes),
+        "benchmark_by_category": by_category,
+    }
+    if overall_v2_values:
+        summary["overall_score_v2_mean"] = round(
+            float(np.mean(np.array(overall_v2_values, dtype=float))),
+            4,
+        )
+    if driving_v2_values:
+        summary["driving_score_v2"] = round(
+            float(np.mean(np.array(driving_v2_values, dtype=float))),
+            4,
+        )
+        summary["driving_score_v2_ci95"] = bootstrap_ci95(
+            driving_v2_values,
+            iterations=BENCHMARK_BOOTSTRAP_ITERATIONS,
+            seed=BENCHMARK_BOOTSTRAP_SEED + 2,
+        )
+    if behavior_penalty_values:
+        summary["behavior_penalty_factor_v2_mean"] = round(
+            float(np.mean(np.array(behavior_penalty_values, dtype=float))),
+            4,
+        )
+    if conservative_penalty_values:
+        summary["conservative_penalty_severity_v2_mean"] = round(
+            float(np.mean(np.array(conservative_penalty_values, dtype=float))),
+            4,
+        )
+    if runtime_penalty_values:
+        summary["runtime_penalty_severity_v2_mean"] = round(
+            float(np.mean(np.array(runtime_penalty_values, dtype=float))),
+            4,
+        )
+    return summary
+
+
+def benchmark_result_validity(
+    *,
+    decision_timeout_rate_mean: Optional[float],
+    fallback_action_rate_mean: Optional[float],
+    timeout_episode_rate: Optional[float],
+) -> Tuple[bool, Optional[str]]:
+    reasons: List[str] = []
+    if decision_timeout_rate_mean is not None and float(decision_timeout_rate_mean) >= 0.5:
+        reasons.append("decision_timeout_rate_mean>=0.5")
+    if fallback_action_rate_mean is not None and float(fallback_action_rate_mean) >= 0.5:
+        reasons.append("fallback_action_rate_mean>=0.5")
+    if timeout_episode_rate is not None and float(timeout_episode_rate) >= 0.5:
+        reasons.append("timeout_episode_rate>=0.5")
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, None
+
+
 class BenchmarkEpisodeEvaluator:
     def __init__(self, case: Dict[str, Any], env) -> None:
         self.case = copy.deepcopy(case)
@@ -218,16 +745,23 @@ class BenchmarkEpisodeEvaluator:
         self.instruction = str(case["instruction"])
         self.success_criteria = dict(case.get("success_criteria") or {})
         self.time_limit_sec = float(case.get("time_limit_sec") or 0.0)
+        self.difficulty = str(case.get("difficulty") or "medium")
+        self.case_group = str(case.get("case_group") or self.category)
 
         uenv = env.unwrapped
         env_cfg = dict(getattr(uenv, "config", {}) or {})
         self.policy_frequency = float(env_cfg.get("policy_frequency", 1) or 1)
         self.max_steps = benchmark_max_steps(case, env_cfg, default_steps=int(math.ceil(self.time_limit_sec or 1.0)))
-        self.initial_lane_rank = _lane_rank(getattr(uenv, "vehicle", None))
+
+        initial_state = inspect_benchmark_initial_state(env)
+        self.initial_lane_rank = initial_state.get("initial_lane_rank")
+        self.initial_speed_mps = float(initial_state.get("initial_speed_mps") or 0.0)
+        self.initial_front_gap_m = initial_state.get("initial_front_gap_m")
+        self.initial_front_vehicle_exists = bool(initial_state.get("initial_front_vehicle_exists"))
+        self.initial_front_vehicle_is_ahead = bool(initial_state.get("initial_front_vehicle_is_ahead"))
+        self.available_actions = list(initial_state.get("available_actions") or [])
         self.initial_x = _vehicle_x(getattr(uenv, "vehicle", None)) or 0.0
-        self.initial_speed_mps = float(getattr(getattr(uenv, "vehicle", None), "speed", 0.0) or 0.0)
         self.initial_front_vehicle_id = None
-        self.initial_front_gap_m = None
         self.initial_front_x = None
 
         ego = getattr(uenv, "vehicle", None)
@@ -236,7 +770,6 @@ class BenchmarkEpisodeEvaluator:
             front_vehicle, _ = road.neighbour_vehicles(ego, ego.lane_index)
             if front_vehicle is not None:
                 self.initial_front_vehicle_id = id(front_vehicle)
-                self.initial_front_gap_m = float(np.linalg.norm(ego.position - front_vehicle.position))
                 self.initial_front_x = _vehicle_x(front_vehicle)
 
         self.hold_steps_required = max(1, int(self.success_criteria.get("hold_steps", 2)))
@@ -339,44 +872,20 @@ class BenchmarkEpisodeEvaluator:
             self.hold_streak = 0
 
     def finalize(self, crashed: bool, episode_stop_reason: str) -> Dict[str, Any]:
-        completion_rate = 1.0 if self.task_completed else 0.0
-        if crashed:
-            ttc_score = 0.0
-        elif self.min_positive_ttc_sec is None:
-            ttc_score = 1.0
-        else:
-            ttc_score = max(
-                0.0,
-                min(1.0, float(self.min_positive_ttc_sec) / BENCHMARK_TTC_SAFE_THRESHOLD_SEC),
-            )
-
-        if len(self.speed_history) <= 1:
-            speed_std_mps = 0.0
-        else:
-            speed_std_mps = float(np.std(np.array(self.speed_history, dtype=float)))
-        speed_variance_score = max(
-            0.0,
-            min(1.0, 1.0 - (speed_std_mps / BENCHMARK_SPEED_STD_SAFE_MPS)),
+        score_metrics = compute_benchmark_case_scores(
+            task_completed=bool(self.task_completed),
+            crashed=bool(crashed),
+            min_positive_ttc_sec=self.min_positive_ttc_sec,
+            speed_history=self.speed_history,
+            completion_time_sec=self.completion_time_sec,
+            time_limit_sec=self.time_limit_sec,
         )
-
-        if self.completion_time_sec is None or self.time_limit_sec <= 0:
-            time_efficiency_score = 0.0
-        else:
-            time_efficiency_score = max(
-                0.0,
-                min(1.0, 1.0 - (float(self.completion_time_sec) / float(self.time_limit_sec))),
-            )
-
-        overall_score = (
-            BENCHMARK_OVERALL_WEIGHTS["ttc"] * ttc_score
-            + BENCHMARK_OVERALL_WEIGHTS["speed_variance"] * speed_variance_score
-            + BENCHMARK_OVERALL_WEIGHTS["time_efficiency"] * time_efficiency_score
-        )
-        driving_score = 0.0 if crashed else (0.5 * completion_rate + 0.5 * overall_score)
 
         if self.failure_reason is None and not self.task_completed:
             if episode_stop_reason == "crash":
                 self.failure_reason = "crash"
+            elif episode_stop_reason == "episode_timeout_cap":
+                self.failure_reason = "episode_timeout_cap"
             elif self.initial_front_vehicle_id is None and str(self.success_criteria.get("type") or "").lower() in {
                 "front_gap_band",
                 "overtake",
@@ -390,6 +899,8 @@ class BenchmarkEpisodeEvaluator:
             "instruction": self.instruction,
             "category": self.category,
             "tags": list(self.case.get("tags") or []),
+            "difficulty": self.difficulty,
+            "case_group": self.case_group,
             "time_limit_sec": round(float(self.time_limit_sec), 3),
             "benchmark_case_env_overrides": copy.deepcopy(self.case.get("env_overrides") or {}),
             "benchmark_success_criteria": copy.deepcopy(self.success_criteria),
@@ -402,14 +913,14 @@ class BenchmarkEpisodeEvaluator:
             "benchmark_completion_step": self.completion_step,
             "benchmark_completion_time_sec": self.completion_time_sec,
             "task_completed": bool(self.task_completed),
-            "completion_rate": round(completion_rate, 4),
-            "ttc_score": round(ttc_score, 4),
-            "speed_variance_score": round(speed_variance_score, 4),
-            "time_efficiency_score": round(time_efficiency_score, 4),
-            "overall_score": round(overall_score, 4),
-            "driving_score": round(driving_score, 4),
+            "completion_rate": score_metrics["completion_rate"],
+            "ttc_score": score_metrics["ttc_score"],
+            "speed_variance_score": score_metrics["speed_variance_score"],
+            "time_efficiency_score": score_metrics["time_efficiency_score"],
+            "overall_score": score_metrics["overall_score"],
+            "driving_score": score_metrics["driving_score"],
             "benchmark_failure_reason": self.failure_reason,
-            "benchmark_speed_std_mps": round(speed_std_mps, 4),
+            "benchmark_speed_std_mps": score_metrics["speed_std_mps"],
             "benchmark_min_positive_ttc_sec": (
                 round(float(self.min_positive_ttc_sec), 4)
                 if self.min_positive_ttc_sec is not None
@@ -417,4 +928,3 @@ class BenchmarkEpisodeEvaluator:
             ),
             "benchmark_max_progress_m": round(float(self.max_progress_m), 4),
         }
-

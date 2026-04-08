@@ -1,4 +1,12 @@
 from .llm_env import configure_runtime_env
+from .config_loader import load_runtime_config
+from .token_usage import (
+    aggregate_episode_token_usage,
+    combine_token_usage_records,
+    build_token_usage_record_from_langchain_message,
+    build_token_usage_record_from_ollama_native_payload,
+    build_whitespace_estimate_token_usage,
+)
 from .highway_env_config import (
     build_highway_env_config,
     resolve_simulation_env_mode,
@@ -13,7 +21,11 @@ from .task_benchmark import (
     benchmark_max_steps,
     build_benchmark_instruction,
     benchmark_metric_config,
+    validate_benchmark_case_set,
+    summarize_benchmark_episodes,
+    benchmark_result_validity,
     BenchmarkEpisodeEvaluator,
+    augment_behavior_aware_benchmark_episode,
 )
 from .model_policy import (
     resolve_model_policy,
@@ -38,9 +50,26 @@ from .path_utils import (
     write_json_atomic,
     read_json,
 )
+from .energy_monitor import (
+    TOKEN_COUNT_METHOD,
+    estimate_generated_tokens,
+    load_idle_calibration,
+    save_idle_calibration,
+    enrich_episode_energy_metrics,
+    summarize_energy_latency_episodes,
+    create_energy_monitor,
+    system_hardware_snapshot,
+    build_energy_tradeoff_summary,
+)
 
 __all__ = [
     "configure_runtime_env",
+    "load_runtime_config",
+    "aggregate_episode_token_usage",
+    "combine_token_usage_records",
+    "build_token_usage_record_from_langchain_message",
+    "build_token_usage_record_from_ollama_native_payload",
+    "build_whitespace_estimate_token_usage",
     "build_highway_env_config",
     "resolve_simulation_env_mode",
     "build_native_highway_env_config",
@@ -52,7 +81,11 @@ __all__ = [
     "benchmark_max_steps",
     "build_benchmark_instruction",
     "benchmark_metric_config",
+    "validate_benchmark_case_set",
+    "summarize_benchmark_episodes",
+    "benchmark_result_validity",
     "BenchmarkEpisodeEvaluator",
+    "augment_behavior_aware_benchmark_episode",
     "resolve_model_policy",
     "apply_model_policy_to_env",
     "build_decision_timeout_penalty_state",
@@ -72,4 +105,13 @@ __all__ = [
     "ensure_experiment_layout",
     "write_json_atomic",
     "read_json",
+    "TOKEN_COUNT_METHOD",
+    "estimate_generated_tokens",
+    "load_idle_calibration",
+    "save_idle_calibration",
+    "enrich_episode_energy_metrics",
+    "summarize_energy_latency_episodes",
+    "create_energy_monitor",
+    "system_hardware_snapshot",
+    "build_energy_tradeoff_summary",
 ]

@@ -1,7 +1,58 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import gymnasium as gym
 import numpy as np
+from highway_env.vehicle.controller import MDPVehicle
+
+
+DEFAULT_STOP_CAPABLE_TARGET_SPEEDS = [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+DEFAULT_NATIVE_TARGET_SPEEDS = [float(x) for x in MDPVehicle.DEFAULT_TARGET_SPEEDS.tolist()]
+
+
+def _normalize_action_target_speeds(raw: Any) -> Optional[List[float]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        tokens = [token.strip() for token in raw.split(",")]
+        values = [float(token) for token in tokens if token]
+    else:
+        try:
+            values = [float(item) for item in list(raw)]
+        except Exception as exc:
+            raise ValueError("sim_action_target_speeds must be a list or comma-separated string.") from exc
+    if not values:
+        raise ValueError("sim_action_target_speeds cannot be empty.")
+    deduped = []
+    for value in values:
+        if not deduped or float(value) != float(deduped[-1]):
+            deduped.append(float(value))
+    if any(value < 0 for value in deduped):
+        raise ValueError("sim_action_target_speeds must be non-negative.")
+    if len(deduped) < 2:
+        raise ValueError("sim_action_target_speeds must contain at least two speeds.")
+    if deduped != sorted(deduped):
+        raise ValueError("sim_action_target_speeds must be sorted ascending.")
+    return deduped
+
+
+def _resolve_action_target_speeds(
+    config: Dict[str, Any],
+    override: Optional[Any] = None,
+) -> Optional[List[float]]:
+    if override is not None:
+        return _normalize_action_target_speeds(override)
+    return _normalize_action_target_speeds(config.get("sim_action_target_speeds"))
+
+
+def _derive_env_profile_label(action_target_speeds: Optional[List[float]]) -> str:
+    if not action_target_speeds:
+        return "default"
+    rounded = [round(float(value), 6) for value in action_target_speeds]
+    if rounded == [round(value, 6) for value in DEFAULT_STOP_CAPABLE_TARGET_SPEEDS]:
+        return "default_stop_capable"
+    if rounded == [round(value, 6) for value in DEFAULT_NATIVE_TARGET_SPEEDS]:
+        return "default"
+    return "custom_action_target_speeds"
 
 
 def build_highway_env_config(
@@ -10,10 +61,12 @@ def build_highway_env_config(
     show_trajectories: bool,
     render_agent: bool,
     lanes_count: int = 4,
+    action_target_speeds_override: Optional[Any] = None,
 ) -> Dict[str, Dict[str, Any]]:
     resolved_lanes_count = int(config.get("lanes_count", lanes_count))
     resolved_ego_spacing = float(config.get("ego_spacing", 4))
     resolved_scaling = float(config.get("scaling", 5))
+    resolved_target_speeds = _resolve_action_target_speeds(config, action_target_speeds_override)
 
     env_cfg: Dict[str, Any] = {
         "observation": {
@@ -26,7 +79,10 @@ def build_highway_env_config(
         },
         "action": {
             "type": "DiscreteMetaAction",
-            "target_speeds": np.linspace(5, 32, 9),
+            "target_speeds": np.array(
+                resolved_target_speeds if resolved_target_speeds is not None else np.linspace(5, 32, 9),
+                dtype=float,
+            ),
         },
         "lanes_count": resolved_lanes_count,
         "vehicles_count": config["vehicle_count"],
@@ -137,6 +193,7 @@ def build_native_highway_env_config(
     show_trajectories: bool,
     render_agent: bool,
     lanes_count: int = 4,
+    action_target_speeds_override: Optional[Any] = None,
 ) -> Dict[str, Any]:
     probe = gym.make(env_id)
     env_cfg = dict(probe.unwrapped.config)
@@ -155,10 +212,17 @@ def build_native_highway_env_config(
     env_cfg["render_agent"] = bool(render_agent)
     if "other_vehicle_type" in config and config["other_vehicle_type"] is not None:
         env_cfg["other_vehicles_type"] = config["other_vehicle_type"]
+    resolved_target_speeds = _resolve_action_target_speeds(config, action_target_speeds_override)
 
     if isinstance(env_cfg.get("observation"), dict):
         env_cfg["observation"] = dict(env_cfg["observation"])
         env_cfg["observation"]["vehicles_count"] = vehicle_count
+    action_cfg = dict(env_cfg.get("action") or {})
+    if action_cfg.get("type") == "DiscreteMetaAction":
+        action_cfg["target_speeds"] = list(
+            resolved_target_speeds if resolved_target_speeds is not None else DEFAULT_NATIVE_TARGET_SPEEDS
+        )
+        env_cfg["action"] = action_cfg
 
     optional_top_level_keys = [
         "simulation_frequency",
@@ -190,6 +254,7 @@ def resolve_simulation_env_bundle(
     env_id_override: Optional[str] = None,
     native_env_defaults_override: Optional[bool] = None,
     lanes_count: int = 4,
+    action_target_speeds_override: Optional[Any] = None,
 ) -> Dict[str, Any]:
     mode = resolve_simulation_env_mode(
         config,
@@ -206,6 +271,10 @@ def resolve_simulation_env_bundle(
             show_trajectories=show_trajectories,
             render_agent=render_agent,
             lanes_count=lanes_count,
+            action_target_speeds_override=action_target_speeds_override,
+        )
+        resolved_action_target_speeds = _normalize_action_target_speeds(
+            (env_cfg.get("action") or {}).get("target_speeds")
         )
         return {
             "requested_env_id": env_id,
@@ -213,6 +282,8 @@ def resolve_simulation_env_bundle(
             "use_native_env_defaults": True,
             "env_config_map": {env_id: env_cfg},
             "env_config_snapshot": env_cfg,
+            "resolved_action_target_speeds": resolved_action_target_speeds,
+            "env_profile_label": _derive_env_profile_label(resolved_action_target_speeds),
             "env_source": mode.get("env_source"),
             "native_source": mode.get("native_source"),
             "warnings": warnings,
@@ -223,6 +294,7 @@ def resolve_simulation_env_bundle(
         show_trajectories=show_trajectories,
         render_agent=render_agent,
         lanes_count=lanes_count,
+        action_target_speeds_override=action_target_speeds_override,
     )
     requested_env_id = str(mode["env_id"])
     if requested_env_id in env_config_map:
@@ -238,6 +310,12 @@ def resolve_simulation_env_bundle(
         "use_native_env_defaults": False,
         "env_config_map": env_config_map,
         "env_config_snapshot": env_config_map[env_id],
+        "resolved_action_target_speeds": _normalize_action_target_speeds(
+            (env_config_map[env_id].get("action") or {}).get("target_speeds")
+        ),
+        "env_profile_label": _derive_env_profile_label(
+            _normalize_action_target_speeds((env_config_map[env_id].get("action") or {}).get("target_speeds"))
+        ),
         "env_source": mode.get("env_source"),
         "native_source": mode.get("native_source"),
         "warnings": warnings,

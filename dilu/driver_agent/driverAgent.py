@@ -19,6 +19,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_community.callbacks import OpenAICallbackHandler
 
 from dilu.scenario.envScenario import EnvScenario
+from dilu.runtime.energy_monitor import estimate_generated_tokens
+from dilu.runtime.token_usage import (
+    combine_token_usage_records,
+    build_token_usage_record_from_langchain_message,
+    build_token_usage_record_from_ollama_native_payload,
+    build_whitespace_estimate_token_usage,
+)
 
 delimiter = "####"
 ACTION_RECOVERY_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*(?:<[^>]+>\s*)?([0-4])\s*$", re.IGNORECASE | re.MULTILINE)
@@ -202,6 +209,11 @@ class DriverAgent:
             "ollama_native_retry_used": False,
             "ollama_native_timeout": False,
             "ollama_native_timeout_short_circuit": False,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "token_count_method": None,
+            "token_usage_source": None,
         }
         if self.oai_api_type == "azure":
             self._log_info("Using Azure Chat API")
@@ -327,24 +339,28 @@ class DriverAgent:
 
     def _invoke_response(self, messages) -> str:
         if self.oai_api_type == "ollama" and self.ollama_use_native_chat:
-            content, _thinking = self._ollama_native_invoke(messages)
-            return content
+            content, _thinking, usage = self._ollama_native_invoke(messages)
+            return content, usage
         response = self._run_with_timeout(self.llm.invoke, messages)
-        return _content_to_text(getattr(response, "content", ""))
+        return _content_to_text(getattr(response, "content", "")), build_token_usage_record_from_langchain_message(response)
 
     def _stream_response(self, messages) -> str:
         if self.oai_api_type == "ollama" and self.ollama_use_native_chat:
-            content, _thinking = self._ollama_native_stream(messages)
-            return content
+            content, _thinking, usage = self._ollama_native_stream(messages)
+            return content, usage
 
         def _collect_stream(msgs):
             chunks = []
+            token_usage = None
             for chunk in self.llm.stream(msgs):
                 chunk_text = _content_to_text(getattr(chunk, "content", ""))
                 if chunk_text:
                     chunks.append(chunk_text)
                     self._log_step(chunk_text, end="", flush=True)
-            return "".join(chunks)
+                chunk_usage = build_token_usage_record_from_langchain_message(chunk)
+                if chunk_usage is not None:
+                    token_usage = chunk_usage
+            return "".join(chunks), token_usage
 
         return self._run_with_timeout(_collect_stream, messages)
 
@@ -409,7 +425,11 @@ class DriverAgent:
         response.raise_for_status()
         data = response.json()
         msg = data.get("message", {}) or {}
-        return _content_to_text(msg.get("content", "")), _content_to_text(msg.get("thinking", ""))
+        return (
+            _content_to_text(msg.get("content", "")),
+            _content_to_text(msg.get("thinking", "")),
+            build_token_usage_record_from_ollama_native_payload(data),
+        )
 
     def _ollama_native_stream_once(self, messages, think_mode: str):
         payload = {
@@ -420,6 +440,7 @@ class DriverAgent:
         payload = self._apply_ollama_think_mode(payload, mode=think_mode)
         content_chunks = []
         thinking_chunks = []
+        final_usage = None
         with requests.post(
             self.ollama_chat_url,
             json=payload,
@@ -445,8 +466,9 @@ class DriverAgent:
                 if chunk_thinking:
                     thinking_chunks.append(chunk_thinking)
                 if data.get("done"):
+                    final_usage = build_token_usage_record_from_ollama_native_payload(data)
                     break
-        return "".join(content_chunks), "".join(thinking_chunks)
+        return "".join(content_chunks), "".join(thinking_chunks), final_usage
 
     def _ollama_native_invoke(self, messages):
         requested_mode = self.ollama_think_mode
@@ -513,13 +535,21 @@ class DriverAgent:
                         "Falling back to OpenAI-compatible path.[/yellow]"
                     )
                     response = self._run_with_timeout(self.llm.invoke, messages)
-                    return _content_to_text(getattr(response, "content", "")), ""
+                    return (
+                        _content_to_text(getattr(response, "content", "")),
+                        "",
+                        build_token_usage_record_from_langchain_message(response),
+                    )
             self.last_ollama_transport = "openai_compat_fallback"
             self._log_warn(
                 f"[yellow]Native Ollama chat failed ({type(exc).__name__}). Falling back to OpenAI-compatible path.[/yellow]"
             )
             response = self._run_with_timeout(self.llm.invoke, messages)
-            return _content_to_text(getattr(response, "content", "")), ""
+            return (
+                _content_to_text(getattr(response, "content", "")),
+                "",
+                build_token_usage_record_from_langchain_message(response),
+            )
 
     def _ollama_native_stream(self, messages):
         requested_mode = self.ollama_think_mode
@@ -588,14 +618,19 @@ class DriverAgent:
 
                     def _collect_stream(msgs):
                         chunks = []
+                        token_usage = None
                         for chunk in self.llm.stream(msgs):
                             chunk_text = _content_to_text(getattr(chunk, "content", ""))
                             if chunk_text:
                                 chunks.append(chunk_text)
                                 self._log_step(chunk_text, end="", flush=True)
-                        return "".join(chunks)
+                            chunk_usage = build_token_usage_record_from_langchain_message(chunk)
+                            if chunk_usage is not None:
+                                token_usage = chunk_usage
+                        return "".join(chunks), token_usage
 
-                    return self._run_with_timeout(_collect_stream, messages), ""
+                    content, usage = self._run_with_timeout(_collect_stream, messages)
+                    return content, "", usage
             self.last_ollama_transport = "openai_compat_fallback"
             self._log_warn(
                 f"[yellow]Native Ollama stream failed ({type(exc).__name__}). Falling back to OpenAI-compatible stream.[/yellow]"
@@ -603,14 +638,19 @@ class DriverAgent:
 
             def _collect_stream(msgs):
                 chunks = []
+                token_usage = None
                 for chunk in self.llm.stream(msgs):
                     chunk_text = _content_to_text(getattr(chunk, "content", ""))
                     if chunk_text:
                         chunks.append(chunk_text)
                         self._log_step(chunk_text, end="", flush=True)
-                return "".join(chunks)
+                    chunk_usage = build_token_usage_record_from_langchain_message(chunk)
+                    if chunk_usage is not None:
+                        token_usage = chunk_usage
+                return "".join(chunks), token_usage
 
-            return self._run_with_timeout(_collect_stream, messages), ""
+            content, usage = self._run_with_timeout(_collect_stream, messages)
+            return content, "", usage
 
     def few_shot_decision(self, scenario_description: str = "Not available", previous_decisions: str = "Not available",
                           available_actions: str = "Not available", driving_intensions: str = "Not available",
@@ -694,6 +734,11 @@ class DriverAgent:
             "ollama_native_retry_used": False,
             "ollama_native_timeout": False,
             "ollama_native_timeout_short_circuit": False,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "token_count_method": None,
+            "token_usage_source": None,
         }
 
         # NOTE: get_openai_callback might return 0 for Ollama
@@ -702,11 +747,12 @@ class DriverAgent:
 
         self._log_step("[cyan]Agent answer:[/cyan]")
         response_content = ""
+        token_usage = None
         try:
             if self.use_streaming:
-                response_content = self._stream_response(messages)
+                response_content, token_usage = self._stream_response(messages)
             else:
-                response_content = self._invoke_response(messages)
+                response_content, token_usage = self._invoke_response(messages)
                 self._log_step(response_content, end="", flush=True)
             self._log_step("\n")
         except TimeoutError:
@@ -724,6 +770,8 @@ class DriverAgent:
                 decision_meta["ollama_native_retry_used"] = bool(self.last_ollama_native_retry_used)
                 decision_meta["ollama_native_timeout"] = bool(self.last_ollama_native_timeout)
                 decision_meta["ollama_native_timeout_short_circuit"] = bool(self.last_ollama_native_timeout_short_circuit)
+            token_usage = build_whitespace_estimate_token_usage(0)
+            decision_meta.update(token_usage)
             self.last_decision_meta = decision_meta
             few_shot_answers_store = ""
             for i in range(len(fewshot_messages)):
@@ -782,13 +830,20 @@ class DriverAgent:
                     messages = [
                         HumanMessage(content=check_message),
                     ]
+                    checker_token_usage = None
                     try:
                         check_response = self._run_with_timeout(self.llm.invoke, messages)
+                        checker_token_usage = build_token_usage_record_from_langchain_message(check_response)
                         check_text = _content_to_text(getattr(check_response, "content", "")).strip()
+                        if checker_token_usage is None and check_text:
+                            checker_token_usage = build_whitespace_estimate_token_usage(
+                                estimate_generated_tokens(check_text)
+                            )
                     except TimeoutError:
                         check_text = ""
                         decision_meta["timed_out"] = True
                         self._log_step("[yellow]Checker timed out. Applying safe fallback parse.[/yellow]")
+                    token_usage = combine_token_usage_records(token_usage, checker_token_usage)
 
                     tail = check_text.split(delimiter)[-1].strip() if delimiter in check_text else check_text
                     try:
@@ -828,6 +883,11 @@ class DriverAgent:
             decision_meta["ollama_native_retry_used"] = bool(self.last_ollama_native_retry_used)
             decision_meta["ollama_native_timeout"] = bool(self.last_ollama_native_timeout)
             decision_meta["ollama_native_timeout_short_circuit"] = bool(self.last_ollama_native_timeout_short_circuit)
+        if token_usage is None:
+            token_usage = build_whitespace_estimate_token_usage(
+                estimate_generated_tokens(response_content)
+            )
+        decision_meta.update(token_usage)
         self.last_decision_meta = decision_meta
         self._log_step(f"Result: {result}")
         return result, response_content, human_message, few_shot_answers_store

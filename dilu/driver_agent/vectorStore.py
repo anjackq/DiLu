@@ -122,6 +122,11 @@ class DrivingMemory:
         if self.encode_type == 'sce_encode':
             pass
         elif self.encode_type == 'sce_language':
+            try:
+                if int(self.scenario_memory._collection.count()) <= 0:
+                    return []
+            except Exception:
+                pass
             query_scenario = driving_scenario.describe(frame_id)
             # Perform similarity search
             similarity_results = self.scenario_memory.similarity_search_with_score(
