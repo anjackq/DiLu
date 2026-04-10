@@ -1,11 +1,14 @@
 import argparse
 import json
-import os
 import math
+import os
+import re
 
 import matplotlib.pyplot as plt
 
 from dilu.runtime import build_model_root, ensure_dir, read_json, write_json_atomic
+
+DENSE_MODEL_THRESHOLD = 8
 
 
 def load_report(path: str) -> dict:
@@ -68,10 +71,21 @@ def _benchmark_invalid_present(aggregates) -> bool:
     return any(row.get("benchmark_result_valid") is False for row in aggregates)
 
 
+def _shorten_model_name(model_name: str) -> str:
+    label = str(model_name or "").strip()
+    if not label:
+        return "model"
+
+    label = re.sub(r"-v\d+(?=-|$)", "", label)
+    label = re.sub(r":(\d+(?:[._]\d+)?)b\b", lambda m: f":{m.group(1).replace('_', '.').replace(',', '.')}", label)
+    label = re.sub(r"-(\d+(?:[._]\d+)?)b(?=-|$)", lambda m: f":{m.group(1).replace('_', '.').replace(',', '.')}", label)
+    label = re.sub(r"(\d)_(\d)", r"\1.\2", label)
+    label = re.sub(r"-{2,}", "-", label).strip("-")
+    return label
+
+
 def _display_model_label(row):
-    label = str(row["model"])
-    if row.get("benchmark_result_valid") is False:
-        label = f"{label}\nINVALID"
+    label = _shorten_model_name(row["model"])
     if row.get("model_skipped_due_to_preflight"):
         label = f"{label}\nPREFLIGHT_SKIP"
     elif row.get("ollama_preflight_ok") is False:
@@ -95,46 +109,162 @@ def _benchmark_headline_score_title(aggregates) -> str:
     return "Driving Score v2" if _has_benchmark_v2_metrics(aggregates) else "Driving Score"
 
 
+def _should_use_horizontal_layout(model_count: int) -> bool:
+    return model_count > DENSE_MODEL_THRESHOLD
+
+
+def _should_show_value_labels(model_count: int) -> bool:
+    return model_count <= DENSE_MODEL_THRESHOLD
+
+
+def _build_output_path(output_path: str, suffix: str | None = None) -> str:
+    if not suffix:
+        return output_path
+    base, ext = os.path.splitext(output_path)
+    return f"{base}_{suffix}{ext or '.png'}"
+
+
+def _metric_value(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _chart(title: str, *keys: str, color: str, ylim=None) -> dict:
+    return {"title": title, "keys": keys, "color": color, "ylim": ylim}
+
+
+def _materialize_charts(aggregates, chart_specs):
+    return [
+        {
+            "title": spec["title"],
+            "values": [_safe_value(_metric_value(row, spec["keys"])) for row in aggregates],
+            "color": spec["color"],
+            "ylim": spec.get("ylim"),
+        }
+        for spec in chart_specs
+    ]
+
+
+def _format_value(value, ylim=None) -> str:
+    if isinstance(ylim, tuple) and ylim == (0, 1):
+        return f"{value:.3f}"
+    if abs(value) >= 1000:
+        return f"{value:.0f}"
+    if abs(value) >= 100:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
+def _flatten_axes(axes):
+    if isinstance(axes, plt.Axes):
+        return [axes]
+    flat_axes = []
+    for row_axes in (axes if isinstance(axes, (list, tuple)) else axes.tolist()):
+        if isinstance(row_axes, (list, tuple)):
+            flat_axes.extend(list(row_axes))
+        else:
+            flat_axes.append(row_axes)
+    return flat_axes
+
+
+def _sorted_aggregates_for_plot(aggregates):
+    benchmark_mode = _has_benchmark_metrics(aggregates)
+    if benchmark_mode:
+        return sorted(
+            aggregates,
+            key=lambda row: (
+                _safe_value(row.get("driving_score_v2", row.get("driving_score"))),
+                _safe_value(row.get("task_completion_rate")),
+                -_safe_value(row.get("decision_latency_ms_avg_mean"), default=1e12),
+            ),
+            reverse=True,
+        )
+
+    return sorted(
+        aggregates,
+        key=lambda row: (
+            _safe_value(row.get("no_collision_rate"), default=1.0 - _safe_value(row.get("crash_rate"))),
+            -_safe_value(row.get("crash_rate")),
+        ),
+        reverse=True,
+    )
+
+
 def _plot_grid(models, charts, title: str, output_path: str) -> None:
     n = len(charts)
-    cols = 2
+    cols = 1 if n <= 3 else 2
     rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 4 * rows))
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-    if isinstance(axes, plt.Axes):
-        flat_axes = [axes]
+    use_horizontal = _should_use_horizontal_layout(len(models))
+    show_value_labels = _should_show_value_labels(len(models))
+
+    if use_horizontal:
+        fig_width = 16
+        panel_height = max(3.8, 1.8 + 0.45 * len(models))
     else:
-        flat_axes = []
-        for row_axes in (axes if isinstance(axes, (list, tuple)) else axes.tolist()):
-            if isinstance(row_axes, (list, tuple)):
-                flat_axes.extend(list(row_axes))
-            else:
-                flat_axes.append(row_axes)
+        fig_width = 14 if cols == 2 else 12
+        panel_height = 4.2
+    fig_height = max(4.8, panel_height * rows)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    flat_axes = _flatten_axes(axes)
 
     for ax, chart in zip(flat_axes[:n], charts):
         values = chart["values"]
-        bars = ax.bar(models, values, color=chart["color"], alpha=0.9)
-        ax.set_title(chart["title"])
-        ax.set_xticks(range(len(models)))
-        ax.set_xticklabels(models, rotation=20, ha="right")
-        if chart["ylim"] is not None:
-            ax.set_ylim(*chart["ylim"])
-        ax.grid(axis="y", linestyle="--", alpha=0.3)
-        for bar, value in zip(bars, values):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height(),
-                f"{value:.3f}" if isinstance(value, float) else str(value),
-                ha="center",
-                va="bottom",
-                fontsize=9,
-            )
+        ax.set_title(chart["title"], fontsize=12)
+        if use_horizontal:
+            positions = list(range(len(models)))
+            bars = ax.barh(positions, values, color=chart["color"], alpha=0.9)
+            ax.set_yticks(positions)
+            ax.set_yticklabels(models, fontsize=9)
+            ax.invert_yaxis()
+            if chart["ylim"] is not None:
+                ax.set_xlim(*chart["ylim"])
+            ax.grid(axis="x", linestyle="--", alpha=0.3)
+            if show_value_labels:
+                max_value = max(values) if values else 0.0
+                label_pad = max(0.02, max_value * 0.01 if max_value else 0.02)
+                for bar, value in zip(bars, values):
+                    ax.text(
+                        bar.get_width() + label_pad,
+                        bar.get_y() + bar.get_height() / 2,
+                        _format_value(value, chart["ylim"]),
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                    )
+        else:
+            positions = list(range(len(models)))
+            bars = ax.bar(positions, values, color=chart["color"], alpha=0.9)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(models, rotation=90, ha="right", fontsize=9)
+            if chart["ylim"] is not None:
+                ax.set_ylim(*chart["ylim"])
+            ax.grid(axis="y", linestyle="--", alpha=0.3)
+            if show_value_labels:
+                for bar, value in zip(bars, values):
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height(),
+                        _format_value(value, chart["ylim"]),
+                        ha="center",
+                        va="bottom",
+                        fontsize=8,
+                    )
 
-    # Hide any unused axes when chart count is odd.
     for ax in flat_axes[n:]:
         ax.axis("off")
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
+    if use_horizontal:
+        longest = max((len(label) for label in models), default=0)
+        fig.subplots_adjust(left=min(0.42, 0.18 + longest / 120.0), hspace=0.4, wspace=0.25)
+    else:
+        longest = max((len(label) for label in models), default=0)
+        fig.subplots_adjust(bottom=min(0.42, 0.18 + longest / 90.0), hspace=0.35, wspace=0.25)
     plt.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
@@ -142,15 +272,16 @@ def _plot_grid(models, charts, title: str, output_path: str) -> None:
 def _plot_energy_tradeoff_scatter(aggregates, output_path: str) -> None:
     if not _has_energy_metrics(aggregates):
         return
+    ordered = _sorted_aggregates_for_plot(aggregates)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Energy / Quality Trade-offs", fontsize=14, fontweight="bold")
 
     scatter_specs = [
         {
             "x_key": "net_energy_j_mean",
-            "y_key": _benchmark_headline_score_key(aggregates) if _has_benchmark_metrics(aggregates) else "no_collision_rate",
+            "y_key": _benchmark_headline_score_key(ordered) if _has_benchmark_metrics(ordered) else "no_collision_rate",
             "title": "Energy vs Quality",
-            "ylabel": _benchmark_headline_score_title(aggregates) if _has_benchmark_metrics(aggregates) else "No-Collision Rate",
+            "ylabel": _benchmark_headline_score_title(ordered) if _has_benchmark_metrics(ordered) else "No-Collision Rate",
         },
         {
             "x_key": "net_energy_j_mean",
@@ -161,11 +292,11 @@ def _plot_energy_tradeoff_scatter(aggregates, output_path: str) -> None:
     ]
 
     for ax, spec in zip(axes, scatter_specs):
-        xs = [_safe_value(row.get(spec["x_key"])) for row in aggregates]
-        ys = [_safe_value(row.get(spec["y_key"])) for row in aggregates]
+        xs = [_safe_value(row.get(spec["x_key"])) for row in ordered]
+        ys = [_safe_value(row.get(spec["y_key"])) for row in ordered]
         ax.scatter(xs, ys, color="#1f78b4", s=70, alpha=0.9)
-        for row, x_val, y_val in zip(aggregates, xs, ys):
-            ax.annotate(_display_model_label(row), (x_val, y_val), fontsize=8, xytext=(4, 4), textcoords="offset points")
+        for row, x_val, y_val in zip(ordered, xs, ys):
+            ax.annotate(_display_model_label(row), (x_val, y_val), fontsize=7, xytext=(4, 3), textcoords="offset points")
         ax.set_title(spec["title"])
         ax.set_xlabel("Net Energy Mean (J)")
         ax.set_ylabel(spec["ylabel"])
@@ -176,228 +307,161 @@ def _plot_energy_tradeoff_scatter(aggregates, output_path: str) -> None:
     plt.close(fig)
 
 
-def plot_aggregates(report: dict, output_path: str, extended: bool = False, all_metrics: bool = False) -> None:
-    aggregates, source_type = _normalize_aggregates(report)
-
-    models = _display_model_labels(aggregates)
-    title_prefix = "DiLu Run Metrics" if source_type == "run" else "DiLu Model Comparison"
-    benchmark_mode = _has_benchmark_metrics(aggregates)
-    energy_mode = _has_energy_metrics(aggregates)
-    latency_runtime_mode = _has_latency_runtime_metrics(aggregates)
-    token_metrics_mode = _has_token_metrics(aggregates)
-    if benchmark_mode and _benchmark_invalid_present(aggregates):
-        title_prefix += " [invalid benchmark runs flagged]"
-    benchmark_headline_key = _benchmark_headline_score_key(aggregates)
-    benchmark_headline_title = _benchmark_headline_score_title(aggregates)
-    benchmark_has_v2 = _has_benchmark_v2_metrics(aggregates)
-
-    if all_metrics:
-        charts = [
-            {"values": [_safe_value(row.get("crash_rate")) for row in aggregates], "title": "Crash Rate", "ylim": (0, 1), "color": "#d95f02"},
-            {"values": [_safe_value(row.get("no_collision_rate")) for row in aggregates], "title": "No-Collision Rate", "ylim": (0, 1), "color": "#1b9e77"},
-            {"values": [_safe_value(row.get("avg_steps")) for row in aggregates], "title": "Average Steps", "ylim": None, "color": "#7570b3"},
-            {"values": [_safe_value(row.get("avg_episode_runtime_sec")) for row in aggregates], "title": "Avg Episode Runtime (s)", "ylim": None, "color": "#66a61e"},
-            {"values": [_safe_value(row.get("ttc_danger_rate_mean")) for row in aggregates], "title": "TTC Danger Rate", "ylim": (0, 1), "color": "#e41a1c"},
-            {"values": [_safe_value(row.get("headway_violation_rate_mean")) for row in aggregates], "title": "Headway Violation Rate", "ylim": (0, 1), "color": "#ff7f00"},
-            {"values": [_safe_value(row.get("lane_change_rate_mean")) for row in aggregates], "title": "Lane Change Rate", "ylim": (0, 1), "color": "#377eb8"},
-            {"values": [_safe_value(row.get("flap_accel_decel_rate_mean")) for row in aggregates], "title": "Accel/Decel Flap Rate", "ylim": (0, 1), "color": "#984ea3"},
-            {"values": [_safe_value(row.get("avg_reward_sum")) for row in aggregates], "title": "Average Reward Sum", "ylim": None, "color": "#4daf4a"},
-            {"values": [_safe_value(row.get("avg_reward_per_step")) for row in aggregates], "title": "Average Reward/Step", "ylim": None, "color": "#a65628"},
-            {"values": [_safe_value(row.get("avg_ego_speed_mps")) for row in aggregates], "title": "Average Ego Speed (m/s)", "ylim": None, "color": "#f781bf"},
-            {"values": [_safe_value(row.get("format_failure_rate_mean")) for row in aggregates], "title": "Format Failure Rate", "ylim": (0, 1), "color": "#999999"},
-            {"values": [_safe_value(row.get("decision_latency_ms_avg_mean", row.get("decision_latency_ms_avg"))) for row in aggregates], "title": "Decision Latency (ms)", "ylim": None, "color": "#17becf"},
-            {"values": [_safe_value(row.get("decision_timeout_rate_mean")) for row in aggregates], "title": "Decision Timeout Rate", "ylim": (0, 1), "color": "#e7298a"},
-            {"values": [_safe_value(row.get("timeout_episode_rate")) for row in aggregates], "title": "Timeout Episode Rate", "ylim": (0, 1), "color": "#a6761d"},
-            {"values": [_safe_value(row.get("fallback_action_rate_mean")) for row in aggregates], "title": "Fallback Action Rate", "ylim": (0, 1), "color": "#666666"},
-            {"values": [_safe_value(row.get("timeout_episode_count")) for row in aggregates], "title": "Timeout Episodes (count)", "ylim": None, "color": "#1f78b4"},
-        ]
-        if energy_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("net_energy_j_mean")) for row in aggregates], "title": "Net Energy Mean (J)", "ylim": None, "color": "#1b9e77"},
-                    {"values": [_safe_value(row.get("energy_per_decision_j_mean")) for row in aggregates], "title": "Energy / Decision (J)", "ylim": None, "color": "#d95f02"},
-                    {"values": [_safe_value(row.get("energy_per_token_j_mean")) for row in aggregates], "title": "Energy / Token (J)", "ylim": None, "color": "#7570b3"},
-                ]
-            )
-        if latency_runtime_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("tokens_per_second_mean")) for row in aggregates], "title": "Tokens / Second", "ylim": None, "color": "#66a61e"},
-                    {"values": [_safe_value(row.get("decision_latency_ms_avg_mean")) for row in aggregates], "title": "Decision Latency Mean (ms)", "ylim": None, "color": "#e6ab02"},
-                    {"values": [_safe_value(row.get("p95_decision_latency_sec_mean")) for row in aggregates], "title": "P95 Decision Latency (s)", "ylim": None, "color": "#a6761d"},
-                ]
-            )
-        if token_metrics_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("prompt_tokens_total_mean")) for row in aggregates], "title": "Prompt Tokens Mean", "ylim": None, "color": "#4daf4a"},
-                    {"values": [_safe_value(row.get("completion_tokens_total_mean")) for row in aggregates], "title": "Completion Tokens Mean", "ylim": None, "color": "#377eb8"},
-                    {"values": [_safe_value(row.get("total_tokens_mean")) for row in aggregates], "title": "Total Tokens Mean", "ylim": None, "color": "#984ea3"},
-                ]
-            )
-        if benchmark_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("task_completion_rate")) for row in aggregates], "title": "Task Completion Rate", "ylim": (0, 1), "color": "#1f78b4"},
-                    {"values": [_safe_value(row.get("ttc_score_mean")) for row in aggregates], "title": "TTC Score Mean", "ylim": (0, 1), "color": "#e41a1c"},
-                    {"values": [_safe_value(row.get("speed_variance_score_mean")) for row in aggregates], "title": "Speed Variance Score Mean", "ylim": (0, 1), "color": "#4daf4a"},
-                    {"values": [_safe_value(row.get("time_efficiency_score_mean")) for row in aggregates], "title": "Time Efficiency Score Mean", "ylim": (0, 1), "color": "#ff7f00"},
-                    {"values": [_safe_value(row.get("overall_score_mean")) for row in aggregates], "title": "Overall Score Mean", "ylim": (0, 1), "color": "#984ea3"},
-                    {"values": [_safe_value(row.get(benchmark_headline_key)) for row in aggregates], "title": benchmark_headline_title, "ylim": (0, 1), "color": "#a65628"},
-                    {"values": [_safe_value(row.get("stop_episode_rate")) for row in aggregates], "title": "Stop Episode Rate", "ylim": (0, 1), "color": "#377eb8"},
-                    {"values": [_safe_value(row.get("near_stop_rate_mean")) for row in aggregates], "title": "Near-Stop Rate Mean", "ylim": (0, 1), "color": "#f781bf"},
-                ]
-            )
-            if benchmark_has_v2:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("overall_score_v2_mean")) for row in aggregates], "title": "Overall Score v2 Mean", "ylim": (0, 1), "color": "#6a3d9a"},
-                        {"values": [_safe_value(row.get("driving_score")) for row in aggregates], "title": "Driving Score (legacy)", "ylim": (0, 1), "color": "#b15928"},
-                        {"values": [_safe_value(row.get("behavior_penalty_factor_v2_mean")) for row in aggregates], "title": "Behavior Penalty Factor v2", "ylim": (0, 1), "color": "#cab2d6"},
-                    ]
-                )
-        _plot_grid(models, charts, f"{title_prefix} (All Metrics)", output_path)
-        return
-
-    if not extended:
-        if benchmark_mode:
-            charts = [
-                {"values": [_safe_value(row.get("task_completion_rate")) for row in aggregates], "title": "Task Completion Rate", "ylim": (0, 1), "color": "#1f78b4"},
-                {"values": [_safe_value(row.get(benchmark_headline_key)) for row in aggregates], "title": benchmark_headline_title, "ylim": (0, 1), "color": "#a65628"},
-                {"values": [_safe_value(row.get("ttc_score_mean")) for row in aggregates], "title": "TTC Score Mean", "ylim": (0, 1), "color": "#e41a1c"},
-                {"values": [_safe_value(row.get("time_efficiency_score_mean")) for row in aggregates], "title": "Time Efficiency Score Mean", "ylim": (0, 1), "color": "#ff7f00"},
-                {"values": [_safe_value(row.get("stop_episode_rate")) for row in aggregates], "title": "Stop Episode Rate", "ylim": (0, 1), "color": "#377eb8"},
-                {"values": [_safe_value(row.get("near_stop_rate_mean")) for row in aggregates], "title": "Near-Stop Rate Mean", "ylim": (0, 1), "color": "#f781bf"},
-            ]
-            if energy_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("net_energy_j_mean")) for row in aggregates], "title": "Net Energy Mean (J)", "ylim": None, "color": "#1b9e77"},
-                    ]
-                )
-            if latency_runtime_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("tokens_per_second_mean")) for row in aggregates], "title": "Tokens / Second", "ylim": None, "color": "#66a61e"},
-                        {"values": [_safe_value(row.get("decision_latency_ms_avg_mean")) for row in aggregates], "title": "Decision Latency Mean (ms)", "ylim": None, "color": "#e6ab02"},
-                    ]
-                )
-            if token_metrics_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("completion_tokens_total_mean")) for row in aggregates], "title": "Completion Tokens Mean", "ylim": None, "color": "#377eb8"},
-                    ]
-                )
-        else:
-            charts = [
-                {"values": [_safe_value(row.get("crash_rate")) for row in aggregates], "title": "Crash Rate", "ylim": (0, 1), "color": "#d95f02"},
-                {"values": [_safe_value(row.get("no_collision_rate")) for row in aggregates], "title": "No-Collision Rate", "ylim": (0, 1), "color": "#1b9e77"},
-                {"values": [_safe_value(row.get("avg_steps")) for row in aggregates], "title": "Average Steps", "ylim": None, "color": "#7570b3"},
-                {"values": [_safe_value(row.get("avg_episode_runtime_sec")) for row in aggregates], "title": "Avg Episode Runtime (s)", "ylim": None, "color": "#66a61e"},
-            ]
-            if energy_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("net_energy_j_mean")) for row in aggregates], "title": "Net Energy Mean (J)", "ylim": None, "color": "#1b9e77"},
-                    ]
-                )
-            if latency_runtime_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("decision_latency_ms_avg_mean")) for row in aggregates], "title": "Decision Latency Mean (ms)", "ylim": None, "color": "#e6ab02"},
-                        {"values": [_safe_value(row.get("tokens_per_second_mean")) for row in aggregates], "title": "Tokens / Second", "ylim": None, "color": "#66a61e"},
-                    ]
-                )
-            if token_metrics_mode:
-                charts.extend(
-                    [
-                        {"values": [_safe_value(row.get("completion_tokens_total_mean")) for row in aggregates], "title": "Completion Tokens Mean", "ylim": None, "color": "#377eb8"},
-                    ]
-                )
-        _plot_grid(models, charts, title_prefix, output_path)
-        return
-
-    if benchmark_mode:
-        charts = [
-            {"values": [_safe_value(row.get("task_completion_rate")) for row in aggregates], "title": "Task Completion Rate", "ylim": (0, 1), "color": "#1f78b4"},
-            {"values": [_safe_value(row.get(benchmark_headline_key)) for row in aggregates], "title": benchmark_headline_title, "ylim": (0, 1), "color": "#a65628"},
-            {"values": [_safe_value(row.get("ttc_score_mean")) for row in aggregates], "title": "TTC Score Mean", "ylim": (0, 1), "color": "#e41a1c"},
-            {"values": [_safe_value(row.get("speed_variance_score_mean")) for row in aggregates], "title": "Speed Variance Score Mean", "ylim": (0, 1), "color": "#4daf4a"},
-            {"values": [_safe_value(row.get("time_efficiency_score_mean")) for row in aggregates], "title": "Time Efficiency Score Mean", "ylim": (0, 1), "color": "#ff7f00"},
-            {"values": [_safe_value(row.get("overall_score_mean")) for row in aggregates], "title": "Overall Score Mean", "ylim": (0, 1), "color": "#984ea3"},
-            {"values": [_safe_value(row.get("stop_episode_rate")) for row in aggregates], "title": "Stop Episode Rate", "ylim": (0, 1), "color": "#377eb8"},
-            {"values": [_safe_value(row.get("near_stop_rate_mean")) for row in aggregates], "title": "Near-Stop Rate Mean", "ylim": (0, 1), "color": "#f781bf"},
-        ]
-        if benchmark_has_v2:
-            charts.insert(
-                5,
-                {"values": [_safe_value(row.get("overall_score_v2_mean")) for row in aggregates], "title": "Overall Score v2 Mean", "ylim": (0, 1), "color": "#6a3d9a"},
-            )
-            charts.insert(
-                2,
-                {"values": [_safe_value(row.get("driving_score")) for row in aggregates], "title": "Driving Score (legacy)", "ylim": (0, 1), "color": "#b15928"},
-            )
-            charts.append(
-                {"values": [_safe_value(row.get("behavior_penalty_factor_v2_mean")) for row in aggregates], "title": "Behavior Penalty Factor v2", "ylim": (0, 1), "color": "#cab2d6"},
-            )
-        if energy_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("net_energy_j_mean")) for row in aggregates], "title": "Net Energy Mean (J)", "ylim": None, "color": "#1b9e77"},
-                    {"values": [_safe_value(row.get("energy_per_decision_j_mean")) for row in aggregates], "title": "Energy / Decision (J)", "ylim": None, "color": "#d95f02"},
-                ]
-            )
-        if latency_runtime_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("tokens_per_second_mean")) for row in aggregates], "title": "Tokens / Second", "ylim": None, "color": "#66a61e"},
-                    {"values": [_safe_value(row.get("decision_latency_ms_avg_mean")) for row in aggregates], "title": "Decision Latency Mean (ms)", "ylim": None, "color": "#e6ab02"},
-                ]
-            )
-        if token_metrics_mode:
-            charts.extend(
-                [
-                    {"values": [_safe_value(row.get("prompt_tokens_total_mean")) for row in aggregates], "title": "Prompt Tokens Mean", "ylim": None, "color": "#4daf4a"},
-                    {"values": [_safe_value(row.get("completion_tokens_total_mean")) for row in aggregates], "title": "Completion Tokens Mean", "ylim": None, "color": "#377eb8"},
-                    {"values": [_safe_value(row.get("total_tokens_mean")) for row in aggregates], "title": "Total Tokens Mean", "ylim": None, "color": "#984ea3"},
-                ]
-            )
-        _plot_grid(models, charts, f"{title_prefix} (Benchmark Tasks)", output_path)
-        return
-
+def build_task_summary_figures(aggregates, title_prefix: str, all_metrics: bool = False):
     charts = [
-        {"values": [_safe_value(row.get("decision_timeout_rate_mean")) for row in aggregates], "title": "Decision Timeout Rate", "ylim": (0, 1), "color": "#e7298a"},
-        {"values": [_safe_value(row.get("fallback_action_rate_mean")) for row in aggregates], "title": "Fallback Action Rate", "ylim": (0, 1), "color": "#666666"},
-        {"values": [_safe_value(row.get("timeout_episode_rate")) for row in aggregates], "title": "Timeout Episode Rate", "ylim": (0, 1), "color": "#a6761d"},
-        {"values": [_safe_value(row.get("ttc_danger_rate_mean")) for row in aggregates], "title": "TTC Danger Rate", "ylim": (0, 1), "color": "#e41a1c"},
+        _chart(_benchmark_headline_score_title(aggregates), _benchmark_headline_score_key(aggregates), color="#a65628", ylim=(0, 1)),
+        _chart("Task Completion Rate", "task_completion_rate", color="#1f78b4", ylim=(0, 1)),
+        _chart("TTC Score Mean", "ttc_score_mean", color="#e41a1c", ylim=(0, 1)),
+        _chart("Time Efficiency Score Mean", "time_efficiency_score_mean", color="#ff7f00", ylim=(0, 1)),
     ]
-    if energy_mode:
+    if all_metrics:
         charts.extend(
             [
-                {"values": [_safe_value(row.get("net_energy_j_mean")) for row in aggregates], "title": "Net Energy Mean (J)", "ylim": None, "color": "#1b9e77"},
-                {"values": [_safe_value(row.get("energy_per_token_j_mean")) for row in aggregates], "title": "Energy / Token (J)", "ylim": None, "color": "#7570b3"},
+                _chart("Overall Score Mean", "overall_score_mean", color="#984ea3", ylim=(0, 1)),
+                _chart("Speed Variance Score Mean", "speed_variance_score_mean", color="#4daf4a", ylim=(0, 1)),
             ]
         )
-    if latency_runtime_mode:
+        if _has_benchmark_v2_metrics(aggregates):
+            charts.extend(
+                [
+                    _chart("Overall Score v2 Mean", "overall_score_v2_mean", color="#6a3d9a", ylim=(0, 1)),
+                    _chart("Driving Score (legacy)", "driving_score", color="#b15928", ylim=(0, 1)),
+                    _chart("Behavior Penalty Factor v2", "behavior_penalty_factor_v2_mean", color="#cab2d6", ylim=(0, 1)),
+                ]
+            )
+    return [{"suffix": None, "title": f"{title_prefix} (Task Summary)", "charts": charts}]
+
+
+def build_runtime_summary_figures(aggregates, title_prefix: str, all_metrics: bool = False):
+    charts = [
+        _chart("Crash Rate", "crash_rate", color="#d95f02", ylim=(0, 1)),
+        _chart("No-Collision Rate", "no_collision_rate", color="#1b9e77", ylim=(0, 1)),
+        _chart("Average Steps", "avg_steps", color="#7570b3"),
+        _chart("Avg Episode Runtime (s)", "avg_episode_runtime_sec", color="#66a61e"),
+    ]
+    if all_metrics:
         charts.extend(
             [
-                {"values": [_safe_value(row.get("tokens_per_second_mean")) for row in aggregates], "title": "Tokens / Second", "ylim": None, "color": "#66a61e"},
-                {"values": [_safe_value(row.get("p95_decision_latency_sec_mean")) for row in aggregates], "title": "P95 Decision Latency (s)", "ylim": None, "color": "#a6761d"},
+                _chart("Average Reward Sum", "avg_reward_sum", color="#4daf4a"),
+                _chart("Average Reward / Step", "avg_reward_per_step", color="#a65628"),
             ]
         )
-    if token_metrics_mode:
-        charts.extend(
-            [
-                {"values": [_safe_value(row.get("prompt_tokens_total_mean")) for row in aggregates], "title": "Prompt Tokens Mean", "ylim": None, "color": "#4daf4a"},
-                {"values": [_safe_value(row.get("completion_tokens_total_mean")) for row in aggregates], "title": "Completion Tokens Mean", "ylim": None, "color": "#377eb8"},
-                {"values": [_safe_value(row.get("total_tokens_mean")) for row in aggregates], "title": "Total Tokens Mean", "ylim": None, "color": "#984ea3"},
-            ]
-        )
-    _plot_grid(models, charts, f"{title_prefix} (Extended Runtime/Safety)", output_path)
+    return [{"suffix": None, "title": title_prefix, "charts": charts}]
+
+
+def build_behavior_figures(aggregates, title_prefix: str, all_metrics: bool = False):
+    if not _has_benchmark_metrics(aggregates):
+        return []
+    charts = [
+        _chart("Stop Episode Rate", "stop_episode_rate", color="#377eb8", ylim=(0, 1)),
+        _chart("Near-Stop Rate Mean", "near_stop_rate_mean", color="#f781bf", ylim=(0, 1)),
+    ]
+    if all_metrics and any(row.get("min_ego_speed_mps_mean") is not None for row in aggregates):
+        charts.append(_chart("Min Ego Speed Mean (m/s)", "min_ego_speed_mps_mean", color="#4daf4a"))
+    return [{"suffix": "behavior", "title": f"{title_prefix} (Behavior)", "charts": charts}]
+
+
+def build_efficiency_figures(aggregates, title_prefix: str, all_metrics: bool = False):
+    charts = []
+    if any(row.get("decision_latency_ms_avg_mean") is not None for row in aggregates):
+        charts.append(_chart("Decision Latency Mean (ms)", "decision_latency_ms_avg_mean", color="#e6ab02"))
+    if any(row.get("tokens_per_second_mean") is not None for row in aggregates):
+        charts.append(_chart("Tokens / Second", "tokens_per_second_mean", color="#66a61e"))
+    if any(row.get("completion_tokens_total_mean") is not None for row in aggregates):
+        charts.append(_chart("Completion Tokens Mean", "completion_tokens_total_mean", color="#377eb8"))
+    if all_metrics:
+        if any(row.get("p95_decision_latency_sec_mean") is not None for row in aggregates):
+            charts.append(_chart("P95 Decision Latency (s)", "p95_decision_latency_sec_mean", color="#a6761d"))
+        if any(row.get("prompt_tokens_total_mean") is not None for row in aggregates):
+            charts.append(_chart("Prompt Tokens Mean", "prompt_tokens_total_mean", color="#4daf4a"))
+        if any(row.get("total_tokens_mean") is not None for row in aggregates):
+            charts.append(_chart("Total Tokens Mean", "total_tokens_mean", color="#984ea3"))
+    if not charts:
+        return []
+    return [{"suffix": "efficiency", "title": f"{title_prefix} (Efficiency)", "charts": charts}]
+
+
+def build_energy_figures(aggregates, title_prefix: str, all_metrics: bool = False):
+    charts = []
+    if any(row.get("net_energy_j_mean") is not None for row in aggregates):
+        charts.append(_chart("Net Energy Mean (J)", "net_energy_j_mean", color="#1b9e77"))
+    if any(row.get("energy_per_decision_j_mean") is not None for row in aggregates):
+        charts.append(_chart("Energy / Decision (J)", "energy_per_decision_j_mean", color="#d95f02"))
+    if any(row.get("energy_per_token_j_mean") is not None for row in aggregates):
+        charts.append(_chart("Energy / Token (J)", "energy_per_token_j_mean", color="#7570b3"))
+    if not charts:
+        return []
+    return [{"suffix": "energy", "title": f"{title_prefix} (Energy)", "charts": charts}]
+
+
+def build_extended_runtime_figures(aggregates, title_prefix: str, all_metrics: bool = False):
+    charts = [
+        _chart("Decision Timeout Rate", "decision_timeout_rate_mean", color="#e7298a", ylim=(0, 1)),
+        _chart("Fallback Action Rate", "fallback_action_rate_mean", color="#666666", ylim=(0, 1)),
+        _chart("Timeout Episode Rate", "timeout_episode_rate", color="#a6761d", ylim=(0, 1)),
+        _chart("TTC Danger Rate", "ttc_danger_rate_mean", color="#e41a1c", ylim=(0, 1)),
+    ]
+    if all_metrics:
+        if any(row.get("timeout_episode_count") is not None for row in aggregates):
+            charts.append(_chart("Timeout Episodes (count)", "timeout_episode_count", color="#1f78b4"))
+        if any(row.get("headway_violation_rate_mean") is not None for row in aggregates):
+            charts.append(_chart("Headway Violation Rate", "headway_violation_rate_mean", color="#ff7f00", ylim=(0, 1)))
+        if any(row.get("lane_change_rate_mean") is not None for row in aggregates):
+            charts.append(_chart("Lane Change Rate", "lane_change_rate_mean", color="#377eb8", ylim=(0, 1)))
+        if any(row.get("flap_accel_decel_rate_mean") is not None for row in aggregates):
+            charts.append(_chart("Accel/Decel Flap Rate", "flap_accel_decel_rate_mean", color="#984ea3", ylim=(0, 1)))
+    materialized = _materialize_charts(aggregates, charts)
+    if not any(any(value != 0 for value in chart["values"]) for chart in materialized):
+        return []
+    return [{"suffix": "runtime", "title": f"{title_prefix} (Runtime / Safety)", "charts": charts}]
+
+
+def _emit_figures(aggregates, figure_specs, output_path):
+    models = _display_model_labels(aggregates)
+    saved_paths = []
+    for spec in figure_specs:
+        path = _build_output_path(output_path, spec["suffix"])
+        charts = _materialize_charts(aggregates, spec["charts"])
+        _plot_grid(models, charts, spec["title"], path)
+        saved_paths.append(path)
+    return saved_paths
+
+
+def plot_aggregates(report: dict, output_path: str, extended: bool = False, all_metrics: bool = False, emit_companions: bool = True) -> dict:
+    aggregates, source_type = _normalize_aggregates(report)
+    ordered = _sorted_aggregates_for_plot(aggregates)
+
+    title_prefix = "DiLu Run Metrics" if source_type == "run" else "DiLu Model Comparison"
+    benchmark_mode = _has_benchmark_metrics(ordered)
+    if benchmark_mode and _benchmark_invalid_present(ordered):
+        title_prefix += " [invalid benchmark runs flagged]"
+
+    figure_specs = []
+    if benchmark_mode:
+        figure_specs.extend(build_task_summary_figures(ordered, title_prefix, all_metrics=all_metrics))
+    else:
+        figure_specs.extend(build_runtime_summary_figures(ordered, title_prefix, all_metrics=all_metrics))
+
+    if emit_companions:
+        figure_specs.extend(build_behavior_figures(ordered, title_prefix, all_metrics=all_metrics))
+        figure_specs.extend(build_efficiency_figures(ordered, title_prefix, all_metrics=all_metrics))
+        figure_specs.extend(build_energy_figures(ordered, title_prefix, all_metrics=all_metrics))
+        if extended or all_metrics:
+            figure_specs.extend(build_extended_runtime_figures(ordered, title_prefix, all_metrics=all_metrics))
+
+    if not figure_specs:
+        raise ValueError("No chart figures were generated for the provided report.")
+
+    saved_paths = _emit_figures(ordered, figure_specs, output_path)
+    return {
+        "primary_path": saved_paths[0],
+        "companion_paths": saved_paths[1:],
+        "all_paths": saved_paths,
+    }
 
 
 def emit_per_model_plots(report: dict, all_metrics: bool, extended: bool) -> list:
-    """Emit one chart per model under each model's plots folder (for eval reports)."""
+    """Emit one plot per model under each model's plots folder (for eval reports)."""
     aggregates, source_type = _normalize_aggregates(report)
     if source_type != "eval":
         return []
@@ -417,12 +481,12 @@ def emit_per_model_plots(report: dict, all_metrics: bool, extended: bool) -> lis
             "aggregate": row,
             "chat_model": model_name,
         }
-        plot_aggregates(single_report, output_path, extended=extended, all_metrics=all_metrics)
+        plot_aggregates(single_report, output_path, extended=extended, all_metrics=all_metrics, emit_companions=False)
         outputs.append(output_path)
     return outputs
 
 
-def update_manifest_for_plots(report: dict, global_plot_path: str, per_model_plot_paths: list) -> None:
+def update_manifest_for_plots(report: dict, global_plot_path: str, companion_plot_paths: list, per_model_plot_paths: list) -> None:
     experiment_root = report.get("experiment_root")
     if not experiment_root:
         return
@@ -431,10 +495,12 @@ def update_manifest_for_plots(report: dict, global_plot_path: str, per_model_plo
     manifest = read_json(manifest_path, default={})
     compare_meta = manifest.setdefault("compare", {})
     compare_meta["latest_plot"] = global_plot_path
+    compare_meta["latest_plot_companions"] = list(companion_plot_paths)
 
     plot_history = compare_meta.setdefault("plot_history", [])
-    if global_plot_path not in plot_history:
-        plot_history.append(global_plot_path)
+    for path in [global_plot_path, *companion_plot_paths]:
+        if path not in plot_history:
+            plot_history.append(path)
 
     models = manifest.setdefault("models", {})
     for path in per_model_plot_paths:
@@ -457,8 +523,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Plot aggregate metrics from evaluate_models_ollama.py JSON output.")
     parser.add_argument("-i", "--input", required=True, help="Path to comparison JSON report")
     parser.add_argument("-o", "--output", default=None, help="Output image path (PNG). Defaults next to input file.")
-    parser.add_argument("--extended", action="store_true", help="Plot extended runtime+safety metrics (timeout/fallback/TTC).")
-    parser.add_argument("--all-metrics", action="store_true", help="Plot all available aggregate metrics in one figure.")
+    parser.add_argument("--extended", action="store_true", help="Emit companion runtime/safety plots for comparison reports.")
+    parser.add_argument("--all-metrics", action="store_true", help="Emit all available metrics across themed plot files.")
     parser.add_argument("--emit-per-model", action="store_true", help="Emit one plot per model under experiment model plot folders.")
     args = parser.parse_args()
 
@@ -471,8 +537,11 @@ def main() -> None:
         output_path = f"{base}_plot.png"
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    plot_aggregates(report, output_path, extended=args.extended, all_metrics=args.all_metrics)
-    print(f"Saved plot: {output_path}")
+    plot_result = plot_aggregates(report, output_path, extended=args.extended, all_metrics=args.all_metrics)
+    print(f"Saved plot: {plot_result['primary_path']}")
+    for companion_path in plot_result["companion_paths"]:
+        print(f"Saved companion plot: {companion_path}")
+
     aggregates, _ = _normalize_aggregates(report)
     if _has_energy_metrics(aggregates):
         base, ext = os.path.splitext(output_path)
@@ -490,7 +559,7 @@ def main() -> None:
         else:
             print("No per-model plots emitted (report is not an experiment eval report with experiment_root).")
 
-    update_manifest_for_plots(report, output_path, per_model_outputs)
+    update_manifest_for_plots(report, plot_result["primary_path"], plot_result["companion_paths"], per_model_outputs)
 
 
 if __name__ == "__main__":

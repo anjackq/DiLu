@@ -132,6 +132,15 @@ Plot task metrics:
 python plot_eval_compare.py -i results/lampilot_highway_smoke/compare/eval_compare_<timestamp>.json --extended
 ```
 
+Plot output layout notes:
+- the primary output is now a task-first summary figure
+- companion figures are emitted automatically beside it:
+  - `_behavior.png`
+  - `_efficiency.png`
+  - `_energy.png` when energy metrics are present
+  - `_runtime.png` when `--extended` or `--all-metrics` is used
+- dense compare plots automatically switch to horizontal bars once more than 8 models are shown
+
 Eval timeout ladder:
 - Eval and benchmark runs use an aggressive bounded timeout ladder: `10 -> 15 -> 20` seconds.
 - Escalation happens only on actual timeout.
@@ -223,6 +232,7 @@ Energy benchmark outputs:
 - compare report: `results/energy_benchmarks/<experiment_id>/compare/energy_latency_compare_<timestamp>.json`
 - per-model summary: `results/energy_benchmarks/<experiment_id>/models/<model>/energy/`
 - plots: `python plot_eval_compare.py -i <compare_report>.json --extended`
+- the primary compare plot is task-first; latency/token/energy/runtime metrics are emitted as companion figures
 
 Timeout policy notes:
 - Eval and benchmark use the laddered policy by default:
@@ -339,6 +349,58 @@ python plot_eval_compare.py -i results/tier1_lightweight_base_instruct/compare/e
 python plot_eval_compare.py -i results/tier1_lightweight_base_instruct/compare/eval_compare_<timestamp>.json --extended
 python plot_eval_compare.py -i results/tier1_lightweight_base_instruct/compare/eval_compare_<timestamp>.json --all-metrics
 ```
+
+For merged and benchmark compare reports:
+- the requested output path remains the main summary plot
+- themed companion plots are written alongside it with suffixes like `_behavior`, `_efficiency`, `_energy`, and `_runtime`
+
+## Tiered SLM Study
+
+For post-hoc tier / lineage analysis across LaMPilot compare reports, use `analysis/slm_study.py`.
+
+1. Fill in `analysis/slm_model_registry.csv` with:
+   - `model_id`, `display_name`, `ollama_tag`, `family`
+   - `variant_kind` as `base` or `fine_tuned`
+   - `base_model_id` for exact fine-tuned pairing
+   - `param_count_b` and tier labels `lightweight`, `midclass`, or `highclass`
+2. Run the study pipeline on one or more benchmark compare reports:
+
+```bash
+python analysis/slm_study.py --registry analysis/slm_model_registry.csv --compare-report results/energy_benchmarks/lampilot_default_benchmark/compare/energy_latency_compare_<timestamp>.json --study-id lampilot_slm_screening
+```
+
+Optional stage-2 finalist energy augmentation:
+
+```bash
+python analysis/slm_study.py --registry analysis/slm_model_registry.csv --compare-report results/energy_benchmarks/lampilot_default_benchmark/compare/energy_latency_compare_<timestamp>.json --finalist-energy-report results/energy_benchmarks/lampilot_finalists/compare/energy_latency_compare_<timestamp>.json --study-id lampilot_slm_confirmatory
+```
+
+Outputs are written under `analysis/out/<study_id>/`:
+- `normalized_records.csv`
+- `tier_leaderboard_<tier>.csv`
+- `paired_deltas.csv`
+- `family_summary.csv`
+- `stage1_shortlist.csv`
+- `invalid_runs.csv`
+- `study_report.md`
+- plots under `analysis/out/<study_id>/plots/`
+
+Targeted rerun workflow for invalid lightweight rows:
+- use `config.lightweight_rerun.yaml` to relax timeout containment for reruns without changing the benchmark or scoring
+- rerun only the invalid lightweight models under the same `lampilot_highway_v1` case set
+- refresh the study by superseding only invalid lightweight rows with the rerun compare report:
+
+```bash
+python analysis/slm_study.py --registry analysis/slm_model_registry.csv --compare-report results/energy_benchmarks/slm_lightweight_stage1/compare/energy_latency_compare_<base>.json --refresh-compare-report results/energy_benchmarks/slm_lightweight_rerun/compare/energy_latency_compare_<rerun>.json --refresh-tier lightweight --acceptance-tier lightweight --study-id slm_lightweight_stage1_refreshed
+```
+
+The refreshed `study_report.md` now includes:
+- study quality classification: `comparison-quality` or `screening-quality`
+- acceptance-gate checks for the target tier
+- refresh merge summary
+- valid ranking conclusions
+- incomplete family conclusions
+- remaining invalid models
 
 ## Troubleshooting (Short)
 

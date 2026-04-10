@@ -128,6 +128,17 @@ class CliMergeTests(unittest.TestCase):
         self.assertEqual(default_bundle["env_profile_label"], "default_stop_capable")
         self.assertEqual(alias_bundle["env_profile_label"], "default_stop_capable")
 
+    def test_lightweight_rerun_config_inherits_default_and_relaxes_timeout_ladder(self):
+        rerun_cfg = load_runtime_config("config.lightweight_rerun.yaml")
+
+        self.assertEqual(rerun_cfg["OPENAI_API_TYPE"], "ollama")
+        self.assertEqual(rerun_cfg["sim_env_id"], "highway-fast-v0")
+        self.assertEqual(rerun_cfg["sim_action_target_speeds"], [0, 5, 10, 15, 20, 25, 30])
+        self.assertEqual(rerun_cfg["eval_timeout_ladder_sec"], [20, 30, 45])
+        self.assertEqual(rerun_cfg["eval_timeout_early_stop_min_decisions"], 8)
+        self.assertEqual(rerun_cfg["eval_timeout_early_stop_consecutive_timeout_fallbacks"], 4)
+        self.assertEqual(rerun_cfg["eval_timeout_model_quarantine_after_collapses"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
