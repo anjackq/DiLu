@@ -2,6 +2,16 @@
 
 Local-first DiLu fork for autonomous driving simulation, model benchmarking, and fine-tuning with Ollama models.
 
+## Overview
+
+DiLu-Ollama is a local-first research framework for evaluating and adapting language-model driving agents in `highway-env` with Ollama-hosted models. The project started from a practical problem: local LLM driving experiments are easy to run informally, but hard to compare rigorously once runtime instability, timeout collapse, model scale, and benchmark reporting begin to interact. This repository turns that workflow into a reproducible benchmark and analysis pipeline.
+
+The core evaluation path uses the DiLu decision loop with a task-conditioned LaMPilot-style highway benchmark, report merging, tiered model studies, and publication-facing analysis bundles. Around that core, the repo also supports fine-tuning workflows and a discrete cross-scenario extension for `highway-fast-v0`, `merge-v0`, and `intersection-v0`, while explicitly treating continuous-control settings such as `parking-v0` as out of scope for the current action interface.
+
+The current evidence base is intentionally reported conservatively. In the three-tier highway study, the lightweight tier provides the strongest usable comparison set, the midclass tier remains screening-quality because several runs are still invalid, and the highclass tier currently functions mainly as a runtime-scalability result because all tested 14B models failed ranking eligibility under the present local timeout policy. The framework therefore supports not only model comparison, but also diagnosis of when benchmark validity breaks down as model size and latency increase.
+
+In that form, DiLu-Ollama is both an experimental framework and a manuscript-oriented analysis workflow: it can run local driving simulations, benchmark base and fine-tuned models, summarize tier-level evidence, extend evaluation across compatible discrete scenarios, and generate publication-ready figures and tables from the resulting study artifacts.
+
 Primary workflows in this repo:
 - Simulation and benchmarking: `evaluate_models_ollama.py`
 - Fine-tuning pipeline: `fine_tuning/run_pipeline.py`
@@ -18,6 +28,19 @@ Supported entrypoints:
 - `analysis/slm_study.py`
 - `analysis/cross_scenario_study.py`
 - `analysis/publication_three_tier_results.py`
+
+## Results Snapshot
+
+The current manuscript-facing snapshot is generated from the three-tier highway benchmark bundle under `analysis/out/publication_three_tier_results_v1/`.
+
+<p align="center">
+  <img src="assets/publication_three_tier_pareto.png" alt="Cross-tier Pareto view for current three-tier results" width="48%" />
+  <img src="assets/publication_three_tier_validity.png" alt="Cross-tier validity summary for current three-tier results" width="48%" />
+</p>
+
+<p align="center">
+  <em>Left: driving-score versus latency Pareto view across ranking-eligible models. Right: validity summary showing that lightweight is the strongest usable evidence tier under the current local runtime policy.</em>
+</p>
 
 ## Quick Start
 
