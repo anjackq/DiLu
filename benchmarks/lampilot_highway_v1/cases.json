@@ -770,5 +770,7 @@
       "difficulty": "hard",
       "case_group": "overtake"
     }
-  ]
+  ],
+  "target_env_id": "highway-fast-v0",
+  "scenario_family": "highway"
 }

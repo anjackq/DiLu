@@ -32,6 +32,14 @@ ACTIONS_DESCRIPTION = {
     4: 'Deceleration - decelerate the vehicle'
 }
 
+ACTION_TOKEN_DESCRIPTIONS = {
+    "LANE_LEFT": "Turn-left - change lane to the left of the current lane",
+    "IDLE": "IDLE - remain in the current lane with current speed",
+    "LANE_RIGHT": "Turn-right - change lane to the right of the current lane",
+    "FASTER": "Acceleration - accelerate the vehicle",
+    "SLOWER": "Deceleration - decelerate the vehicle",
+}
+
 
 class EnvScenario:
     def __init__(
@@ -75,6 +83,75 @@ class EnvScenario:
         else:
             self.dbBridge = NullDBBridge(self.database, env)
 
+    def scenario_family(self) -> str:
+        env_type = str(self.envType or "").strip().lower()
+        if env_type.startswith("merge-"):
+            return "merge"
+        if env_type.startswith("intersection-"):
+            return "intersection"
+        if env_type.startswith("parking-"):
+            return "parking"
+        return "highway"
+
+    def is_intersection_family(self) -> bool:
+        return self.scenario_family() == "intersection"
+
+    def _action_catalog(self) -> Dict[int, str]:
+        action_type = getattr(self.env.unwrapped, "action_type", None)
+        actions = getattr(action_type, "actions", None)
+        if isinstance(actions, dict) and actions:
+            return {int(key): str(value) for key, value in actions.items()}
+
+        discrete_n = getattr(getattr(self.env, "action_space", None), "n", None)
+        if isinstance(discrete_n, int):
+            return {
+                int(action_id): ACTIONS_ALL.get(int(action_id), str(action_id))
+                for action_id in range(discrete_n)
+            }
+
+        raise NotImplementedError(
+            f"Environment {self.envType} does not expose a discrete action catalog."
+        )
+
+    def available_action_ids(self) -> List[int]:
+        try:
+            available_actions = self.env.unwrapped.get_available_actions()
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"Environment {self.envType} does not provide discrete available actions."
+            ) from exc
+        return [int(action_id) for action_id in list(available_actions)]
+
+    def describe_action_id(self, action_id: int) -> str:
+        token = self._action_catalog().get(int(action_id))
+        if token is None:
+            return ACTIONS_DESCRIPTION.get(int(action_id), f"Action {action_id}")
+        return ACTION_TOKEN_DESCRIPTIONS.get(
+            token,
+            f"{token.replace('_', ' ').title()} - execute {token.lower()} action",
+        )
+
+    def action_catalog_with_descriptions(self) -> Dict[int, Dict[str, str]]:
+        return {
+            int(action_id): {
+                "token": str(token),
+                "description": self.describe_action_id(int(action_id)),
+            }
+            for action_id, token in self._action_catalog().items()
+        }
+
+    def preferred_fallback_action_id(self) -> int:
+        available_ids = self.available_action_ids()
+        catalog = self._action_catalog()
+        preferred_tokens = ("SLOWER", "IDLE", "FASTER", "LANE_RIGHT", "LANE_LEFT")
+        for token in preferred_tokens:
+            for action_id in available_ids:
+                if catalog.get(int(action_id)) == token:
+                    return int(action_id)
+        if available_ids:
+            return int(available_ids[0])
+        raise ValueError(f"No available actions exposed by environment {self.envType}")
+
 #    def getSurrendVehicles(self, vehicles_count: int) -> List[IDMVehicle]:
 #        return self.road.close_vehicles_to(
 #            self.ego, self.env.PERCEPTION_DISTANCE,
@@ -99,7 +176,7 @@ class EnvScenario:
         )
 
     def isInJunction(self, vehicle: Union[IDMVehicle, MDPVehicle]) -> float:
-        if self.envType == 'intersection-v1':
+        if self.is_intersection_family():
             x, y = vehicle.position
             # 这里交叉口的范围是 -12~12, 这里是为了保证车辆可以检测到交叉口内部的信息
             # 这个时候车辆需要提前减速
@@ -123,10 +200,9 @@ class EnvScenario:
 
     def availableActionsDescription(self) -> str:
         avaliableActionDescription = 'Your available actions are: \n'
-        #availableActions = self.env.get_available_actions()
-        availableActions = self.env.unwrapped.get_available_actions()
+        availableActions = self.available_action_ids()
         for action in availableActions:
-            avaliableActionDescription += ACTIONS_DESCRIPTION[action] + ' Action_id: ' + str(
+            avaliableActionDescription += self.describe_action_id(int(action)) + ' Action_id: ' + str(
                 action) + '\n'
         # if 1 in availableActions:
         #     avaliableActionDescription += 'You should check IDLE action as FIRST priority. '
@@ -314,7 +390,7 @@ class EnvScenario:
                         continue
                 else:
                     continue
-                if self.envType == 'intersection-v1':
+                if self.is_intersection_family():
                     SVDescription += f"The position of it is `({sv.position[0]:.2f}, {sv.position[1]:.2f})`, speed is {sv.speed:.2f} m/s, acceleration is {sv.action['acceleration']:.2f} m/s^2.\n"
                 else:
                     SVDescription += f"The position of it is `({sv.position[0]:.2f}, {sv.position[1]:.2f})`, speed is {sv.speed:.2f} m/s, acceleration is {sv.action['acceleration']:.2f} m/s^2, and lane position is {self.getLanePosition(sv):.2f} m.\n"
@@ -392,6 +468,24 @@ class EnvScenario:
             roadCondition = "You are driving in an intersection, you can't change lane. "
             roadCondition += f"Your current position is `({self.ego.position[0]:.2f}, {self.ego.position[1]:.2f})`, speed is {self.ego.speed:.2f} m/s, and acceleration is {self.ego.action['acceleration']:.2f} m/s^2.\n"
             SVDescription = self.describeSVJunctionLane(currentLaneIndex)
+        elif self.is_intersection_family():
+            lane_position = None
+            try:
+                lane_position = self.getLanePosition(self.ego)
+            except Exception:
+                lane_position = None
+            roadCondition = (
+                "You are approaching an intersection. Lane changes are not available in this scenario, "
+                "so focus on safe gap acceptance, yielding when needed, and clearing the junction safely. "
+            )
+            roadCondition += (
+                f"Your current position is `({self.ego.position[0]:.2f}, {self.ego.position[1]:.2f})`, "
+                f"speed is {self.ego.speed:.2f} m/s, and acceleration is {self.ego.action['acceleration']:.2f} m/s^2"
+            )
+            if lane_position is not None:
+                roadCondition += f", and lane position is {lane_position:.2f} m"
+            roadCondition += ".\n"
+            SVDescription = self.describeSVNormalLane(currentLaneIndex)
         else:
             roadCondition = self.processNormalLane(currentLaneIndex)
             SVDescription = self.describeSVNormalLane(currentLaneIndex)

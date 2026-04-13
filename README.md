@@ -402,6 +402,31 @@ The refreshed `study_report.md` now includes:
 - incomplete family conclusions
 - remaining invalid models
 
+## Cross-Scenario Discrete Benchmarks
+
+Built-in case sets now cover three discrete highway-env families:
+- `lampilot_highway_v1` -> `highway-fast-v0`
+- `lampilot_merge_v1` -> `merge-v0`
+- `lampilot_intersection_v1` -> `intersection-v0`
+
+Run one environment per benchmark job:
+
+```bash
+python evaluate_models_ollama.py --config config.yaml --env-id merge-v0 --benchmark-case-set lampilot_merge_v1 --models qwen3:4b --experiment-id merge_smoke --progress
+python evaluate_models_ollama.py --config config.yaml --env-id intersection-v0 --benchmark-case-set lampilot_intersection_v1 --models qwen3:4b --experiment-id intersection_smoke --progress
+```
+
+Notes:
+- the discrete framework now rejects unsupported continuous-control envs such as `parking-v0`
+- `merge-v0` is exposed by highway-env as a fixed-layout merge setup, so `lampilot_merge_v1` uses protocol-sliced merge tasks rather than pretending the native env provides rich procedurally varied traffic families
+- highway remains the only scenario using `driving_score_v2` as the headline metric; merge and intersection keep scenario-local task metrics without reusing the highway behavior-aware scalar
+
+For post-hoc cross-scenario synthesis, use `analysis/cross_scenario_study.py`:
+
+```bash
+python analysis/cross_scenario_study.py --registry analysis/slm_model_registry.csv --scenario-report highway=results/energy_benchmarks/highway_run/compare/energy_latency_compare_<timestamp>.json --scenario-report merge=results/energy_benchmarks/merge_run/compare/energy_latency_compare_<timestamp>.json --scenario-report intersection=results/energy_benchmarks/intersection_run/compare/energy_latency_compare_<timestamp>.json --study-id lampilot_cross_scenario_demo
+```
+
 ## Troubleshooting (Short)
 
 - Long waits on Qwen small models:

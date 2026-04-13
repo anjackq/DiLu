@@ -24,6 +24,25 @@ COMPAT_METRIC_KEYS = [
 ]
 
 
+def _infer_compare_metadata_from_summary(summary_payload: Dict) -> Dict:
+    metrics_config = summary_payload.get("metrics_config", {}) or {}
+    benchmark_mode = bool(metrics_config.get("benchmark_mode"))
+    benchmark_metric_config = metrics_config.get("benchmark_metric_config", {}) or {}
+    headline_task_metric = (
+        benchmark_metric_config.get("recommended_headline_metric")
+        or summary_payload.get("headline_task_metric")
+        or ("driving_score_v2" if benchmark_mode else None)
+    )
+    return {
+        "benchmark_mode": benchmark_mode,
+        "benchmark_case_set": metrics_config.get("benchmark_case_set"),
+        "benchmark_case_set_path": metrics_config.get("benchmark_case_set_path"),
+        "benchmark_categories": list(metrics_config.get("benchmark_categories") or []),
+        "headline_task_metric": headline_task_metric,
+        "efficiency_metrics_reported": bool(summary_payload.get("aggregate", {}).get("decision_latency_ms_avg_mean") is not None),
+    }
+
+
 def _resolve_existing_path(raw_path: Optional[str], experiment_root: str) -> Optional[str]:
     if not raw_path:
         return None
@@ -66,6 +85,16 @@ def _find_matching_episodes(summary_path: str, eval_dir: str) -> Optional[str]:
     return _latest_file(os.path.join(eval_dir, "eval_episodes_*.json"))
 
 
+def _find_matching_energy_episodes(summary_path: str, energy_dir: str) -> Optional[str]:
+    m = re.match(r"^energy_summary_(.+)\.json$", os.path.basename(summary_path))
+    if m:
+        ts = m.group(1)
+        sibling = os.path.join(energy_dir, f"energy_episodes_{ts}.json")
+        if os.path.exists(sibling):
+            return sibling
+    return _latest_file(os.path.join(energy_dir, "energy_episodes_*.json"))
+
+
 def _lookup_model_entry(models: Dict, model_name: str) -> Optional[Dict]:
     if not isinstance(models, dict):
         return None
@@ -85,6 +114,7 @@ def _discover_model_artifacts(experiment_root: str, model_name: str) -> Optional
     model_slug = model_entry.get("slug") if isinstance(model_entry, dict) else None
     model_slug = model_slug or slugify_model_name(model_name)
     eval_dir = os.path.join(experiment_root, "models", model_slug, "eval")
+    energy_dir = os.path.join(experiment_root, "models", model_slug, "energy")
 
     summary_path = None
     episodes_path = None
@@ -106,6 +136,13 @@ def _discover_model_artifacts(experiment_root: str, model_name: str) -> Optional
             summary_path = os.path.abspath(newest_summary)
             episodes_path = _find_matching_episodes(summary_path, eval_dir)
             source_kind = "filesystem_latest"
+
+    if not summary_path and os.path.isdir(energy_dir):
+        newest_summary = _latest_file(os.path.join(energy_dir, "energy_summary_*.json"))
+        if newest_summary:
+            summary_path = os.path.abspath(newest_summary)
+            episodes_path = _find_matching_energy_episodes(summary_path, energy_dir)
+            source_kind = "filesystem_latest_energy"
 
     if not summary_path:
         return None
@@ -154,12 +191,25 @@ def _discover_available_models(experiment_root: str) -> List[Dict]:
     if os.path.isdir(model_root):
         for slug in sorted(os.listdir(model_root)):
             eval_dir = os.path.join(model_root, slug, "eval")
-            if not os.path.isdir(eval_dir):
-                continue
-            newest_summary = _latest_file(os.path.join(eval_dir, "eval_summary_*.json"))
+            energy_dir = os.path.join(model_root, slug, "energy")
+            newest_summary = None
+            newest_episodes = None
+            source_kind = None
+
+            if os.path.isdir(eval_dir):
+                newest_summary = _latest_file(os.path.join(eval_dir, "eval_summary_*.json"))
+                if newest_summary:
+                    newest_episodes = _find_matching_episodes(newest_summary, eval_dir)
+                    source_kind = "filesystem_latest"
+
+            if newest_summary is None and os.path.isdir(energy_dir):
+                newest_summary = _latest_file(os.path.join(energy_dir, "energy_summary_*.json"))
+                if newest_summary:
+                    newest_episodes = _find_matching_energy_episodes(newest_summary, energy_dir)
+                    source_kind = "filesystem_latest_energy"
+
             if not newest_summary:
                 continue
-            newest_episodes = _find_matching_episodes(newest_summary, eval_dir)
             inferred_name = str(slug)
             # Try to recover canonical model name from summary payload.
             try:
@@ -171,7 +221,7 @@ def _discover_available_models(experiment_root: str) -> List[Dict]:
             candidate = {
                 "model": inferred_name,
                 "slug": slug,
-                "source_kind": "filesystem_latest",
+                "source_kind": source_kind,
                 "summary_path": os.path.abspath(newest_summary),
                 "episodes_path": os.path.abspath(newest_episodes) if newest_episodes else None,
             }
@@ -232,6 +282,9 @@ def _compat_profile(model_name: str, source: Dict, summary_payload: Dict, episod
     manifest = source.get("manifest", {}) or {}
     few_shot_num = manifest.get("few_shot_num")
     simulation_duration = manifest.get("simulation_duration")
+    metrics_config = summary_payload.get("metrics_config", {}) or {}
+    if few_shot_num is None:
+        few_shot_num = metrics_config.get("few_shot_num")
     if simulation_duration is None and episodes:
         simulation_duration = episodes[0].get("max_steps")
     if few_shot_num is None or simulation_duration is None:
@@ -243,7 +296,6 @@ def _compat_profile(model_name: str, source: Dict, summary_payload: Dict, episod
         if "seed" not in ep:
             raise ValueError(f"Model '{model_name}' has episode without 'seed'.")
         seeds.append(int(ep["seed"]))
-    metrics_config = summary_payload.get("metrics_config", {}) or {}
     metrics_subset = {k: metrics_config.get(k) for k in COMPAT_METRIC_KEYS}
     return {
         "few_shot_num": int(few_shot_num),
@@ -411,6 +463,12 @@ def main() -> None:
     ordered_aggregates = [per_model_payloads[m]["aggregate"] for m in selected_models]
     ordered_per_model = {m: per_model_payloads[m]["episodes"] for m in selected_models}
     baseline_metrics = copy.deepcopy(per_model_payloads[selected_models[0]]["metrics_config"])
+    compare_metadata = _infer_compare_metadata_from_summary(
+        {
+            "metrics_config": baseline_metrics,
+            "aggregate": ordered_aggregates[0] if ordered_aggregates else {},
+        }
+    )
     report = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "report_schema_version": "2.0",
@@ -432,6 +490,7 @@ def main() -> None:
         "model_eval_outputs": {},
         "model_run_outputs": {},
     }
+    report.update(compare_metadata)
 
     write_json_atomic(out_path, report)
     _update_manifest_for_merged_report(experiment_root, args.experiment_id, out_path)

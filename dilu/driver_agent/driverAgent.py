@@ -28,8 +28,8 @@ from dilu.runtime.token_usage import (
 )
 
 delimiter = "####"
-ACTION_RECOVERY_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*(?:<[^>]+>\s*)?([0-4])\s*$", re.IGNORECASE | re.MULTILINE)
-ACTION_ANYWHERE_PATTERN = re.compile(r"\b([0-4])\b")
+ACTION_RECOVERY_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*(?:<[^>]+>\s*)?(-?\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+ACTION_ANYWHERE_PATTERN = re.compile(r"\b-?\d+\b")
 
 
 def _content_to_text(content) -> str:
@@ -325,6 +325,113 @@ class DriverAgent:
         except Exception:
             pass
         return timeout_sec
+
+    def _valid_action_ids(self) -> List[int]:
+        try:
+            return sorted(int(action_id) for action_id in self.sce.available_action_ids())
+        except Exception:
+            return [0, 1, 2, 3, 4]
+
+    def _fallback_action_id(self) -> int:
+        try:
+            return int(self.sce.preferred_fallback_action_id())
+        except Exception:
+            valid = self._valid_action_ids()
+            return 4 if 4 in valid else valid[0]
+
+    def _action_descriptions(self) -> dict[int, dict[str, str]]:
+        try:
+            return self.sce.action_catalog_with_descriptions()
+        except Exception:
+            return {}
+
+    def _allowed_action_text(self) -> str:
+        return ", ".join(str(action_id) for action_id in self._valid_action_ids())
+
+    def _action_table_markdown(self) -> str:
+        rows = ["| Action_id | Action Description |", "|-----------|--------------------|"]
+        action_descriptions = self._action_descriptions()
+        for action_id in self._valid_action_ids():
+            description = action_descriptions.get(int(action_id), {}).get("description", f"Action {action_id}")
+            rows.append(f"| {action_id} | {description} |")
+        return "\n".join(rows)
+
+    def _is_valid_action_id(self, value: int) -> bool:
+        return int(value) in set(self._valid_action_ids())
+
+    def _extract_valid_action_from_text(self, text: str) -> int:
+        try:
+            value = int(str(text).strip())
+            if self._is_valid_action_id(value):
+                return value
+        except Exception:
+            pass
+
+        recovered = ACTION_RECOVERY_PATTERN.findall(text or "")
+        for token in reversed(recovered):
+            value = int(token)
+            if self._is_valid_action_id(value):
+                return value
+
+        matches = ACTION_ANYWHERE_PATTERN.findall(text or "")
+        for token in reversed(matches):
+            value = int(token)
+            if self._is_valid_action_id(value):
+                return value
+
+        raise ValueError("No valid action id found in text")
+
+    def _build_system_message(self, fallback_action_id: int) -> str:
+        scenario_family = getattr(self.sce, "scenario_family", lambda: "highway")()
+        allowed_actions = self._allowed_action_text()
+        if scenario_family == "intersection":
+            drive_logic = textwrap.dedent(f"""\
+            ### DRIVE LOGIC:
+            1. SAFETY: Avoid entering a conflict zone unless the gap is clearly safe. If uncertain, use the safer slower action when available.
+            2. PROGRESS: Once a safe gap exists, continue through the intersection without unnecessary hesitation.
+            3. NO LANE CHANGES: Treat this as a longitudinal-only decision problem. Do not invent lane changes.
+            4. EFFICIENCY: Prefer smooth progress, but only after safety is satisfied.
+            """)
+            step3 = "3. **Gap Acceptance:** [Analyze whether it is safe to continue, hold speed, or slow down]"
+        elif scenario_family == "merge":
+            drive_logic = textwrap.dedent(f"""\
+            ### DRIVE LOGIC:
+            1. SAFETY: Maintain a safe gap to nearby traffic and avoid forcing a merge.
+            2. MERGE PROGRESS: If a safe mainline gap exists, prioritize merging smoothly into the target lane.
+            3. NO-UNNECESSARY-BRAKING: Avoid full hesitation when a safe merge opportunity is already present.
+            4. EFFICIENCY: Preserve stable speed and lane control while completing the merge.
+            """)
+            step3 = "3. **Merge Feasibility:** [Analyze whether a safe merge gap exists and whether lane change is necessary now]"
+        else:
+            drive_logic = textwrap.dedent(f"""\
+            ### DRIVE LOGIC:
+            1. SAFETY: If a lead car is closer than 25m and your speed is higher, you should prefer the safer slower action when available.
+            2. NO-UNNECESSARY-LANE-CHANGE: If the lead car in your current lane is not slower than you (or not close enough to block you), do not change lane just for preference.
+            3. EFFICIENCY: Maintain a brisk but safe cruising speed.
+            4. TRAFFIC RULE (RIGHT-HAND TRAFFIC): Prefer overtaking from the LEFT lane when overtaking is necessary and safe.
+            """)
+            step3 = "3. **Lane Change Feasibility:** [Analyze if changing lanes is safe or necessary]"
+
+        return textwrap.dedent(f"""\
+        You are an autonomous driving decision module. You must strictly follow a Chain of Thought reasoning process before making a decision.
+
+        {drive_logic}
+        You MUST format your response EXACTLY like this, using these exact headings:
+
+        **Step-by-Step Explanation:**
+        1. **Safety Check:** [Analyze the nearest relevant traffic and collision risk]
+        2. **Efficiency Consideration:** [Analyze whether you should maintain, increase, or reduce speed]
+        {step3}
+        4. **Conclusion:** [Summarize the best course of action]
+
+        **Answer:**
+        Reasoning: [1-sentence summary of the conclusion]
+        Response to user:{delimiter} {fallback_action_id}
+
+        IMPORTANT:
+        - Output one real integer action id from: {allowed_actions}
+        - Do NOT output angle brackets like <Action_id_integer>.
+        """)
 
     def _run_with_timeout(self, fn, *args):
         executor = ThreadPoolExecutor(max_workers=1)
@@ -656,35 +763,9 @@ class DriverAgent:
                           available_actions: str = "Not available", driving_intensions: str = "Not available",
                           fewshot_messages: List[str] = None, fewshot_answers: List[str] = None):
         # for template usage refer to: https://python.langchain.com/docs/modules/model_io/prompts/prompt_templates/
-
-        system_message = textwrap.dedent(f"""\
-        You are an autonomous driving decision module. You must strictly follow a Chain of Thought reasoning process before making a decision.
-
-        ### DRIVE LOGIC:
-        1. SAFETY: If a lead car is closer than 25m and your speed is higher, you MUST decelerate (Action_id 4).
-        2. NO-UNNECESSARY-LANE-CHANGE: If the lead car in your current lane is not slower than you (or not close enough to block you), do not change lane just for preference.
-        3. EFFICIENCY: Maintain a target speed of 28m/s.
-        4. TRAFFIC RULE (RIGHT-HAND TRAFFIC): Prefer overtaking from the LEFT lane.
-           - If blocked by slower traffic in your lane, first consider Turn-left (Action_id 0) when safe.
-           - Do NOT choose Turn-right (Action_id 2) to overtake a slower vehicle in front unless there is a clear safety reason and left change is not feasible.
-           - If no safe lane change exists and risk is increasing, decelerate (Action_id 4).
-
-        You MUST format your response EXACTLY like this, using these exact headings:
-
-        **Step-by-Step Explanation:**
-        1. **Safety Check:** [Analyze distance and speed of the lead car and adjacent cars]
-        2. **Efficiency Consideration:** [Analyze if you need to speed up to reach the target speed]
-        3. **Lane Change Feasibility:** [Analyze if changing lanes is safe or necessary]
-        4. **Conclusion:** [Summarize the best course of action]
-
-        **Answer:**
-        Reasoning: [1-sentence summary of the conclusion]
-        Response to user:{delimiter} 4
-
-        IMPORTANT:
-        - Output a real integer (0-4), not a placeholder.
-        - Do NOT output angle brackets like <Action_id_integer>.
-        """)
+        fallback_action_id = self._fallback_action_id()
+        valid_action_ids = self._valid_action_ids()
+        system_message = self._build_system_message(fallback_action_id)
 
         human_message = f"""\
         Above messages are some examples of how you make a decision successfully in the past. Those scenarios are similar to the current scenario. You should refer to those examples to make a decision for the current scenario. 
@@ -756,13 +837,16 @@ class DriverAgent:
                 self._log_step(response_content, end="", flush=True)
             self._log_step("\n")
         except TimeoutError:
-            response_content = f"Decision timeout. Response to user:{delimiter} 4"
-            self._log_error(f"\n[red]Decision timeout after {self.decision_timeout_sec:.1f}s. Fallback action: 4[/red]")
+            response_content = f"Decision timeout. Response to user:{delimiter} {fallback_action_id}"
+            self._log_error(
+                f"\n[red]Decision timeout after {self.decision_timeout_sec:.1f}s. "
+                f"Fallback action: {fallback_action_id}[/red]"
+            )
             decision_meta["timed_out"] = True
             decision_meta["used_fallback"] = True
             decision_meta["fallback_reason"] = "decision_timeout"
             decision_meta["parse_mode"] = "timeout_fallback"
-            decision_meta["selected_action"] = 4
+            decision_meta["selected_action"] = fallback_action_id
             decision_meta["decision_elapsed_sec"] = round(time.time() - start_time, 3)
             if self.oai_api_type == "ollama":
                 decision_meta["ollama_transport"] = self.last_ollama_transport
@@ -776,56 +860,49 @@ class DriverAgent:
             few_shot_answers_store = ""
             for i in range(len(fewshot_messages)):
                 few_shot_answers_store += fewshot_answers[i] + "\n---------------\n"
-            self._log_step("Result: 4")
-            return 4, response_content, human_message, few_shot_answers_store
+            self._log_step(f"Result: {fallback_action_id}")
+            return fallback_action_id, response_content, human_message, few_shot_answers_store
 
         decision_action = response_content.split(delimiter)[-1]
         try:
-            result = int(decision_action.strip())
-            if result < 0 or result > 4:
-                raise ValueError
+            result = self._extract_valid_action_from_text(decision_action)
         except ValueError:
-            # Common SLM failure mode: emits placeholder line and then the real integer on the next line.
-            # Recover locally before spending another LLM call on the checker.
-            matches = ACTION_RECOVERY_PATTERN.findall(response_content)
-            if matches:
-                result = int(matches[-1])
+            try:
+                result = self._extract_valid_action_from_text(response_content)
                 decision_meta["parse_mode"] = "regex_recovered"
                 self._log_step(f"[yellow]Recovered action via regex parse:[/yellow] {result}")
-            else:
+            except ValueError:
                 if not self.enable_checker_llm:
-                    any_matches = ACTION_ANYWHERE_PATTERN.findall(response_content)
-                    if any_matches:
-                        result = int(any_matches[-1])
+                    try:
+                        result = self._extract_valid_action_from_text(response_content)
                         decision_meta["parse_mode"] = "loose_recovered"
                         self._log_step(f"[yellow]Recovered action from loose parse:[/yellow] {result}")
-                    else:
-                        result = 4
+                    except ValueError:
+                        result = fallback_action_id
                         decision_meta["used_fallback"] = True
                         decision_meta["fallback_reason"] = "parse_fallback"
                         decision_meta["parse_mode"] = "parse_fallback"
-                        self._log_step("[red]Output parse failed. Checker disabled; fallback to action 4.[/red]")
+                        self._log_step(
+                            f"[red]Output parse failed. Checker disabled; fallback to action {fallback_action_id}.[/red]"
+                        )
                 else:
                     decision_meta["checker_used"] = True
                     self._log_step("Output is not a int number, checking the output...")
+                    action_table = self._action_table_markdown()
+                    allowed_actions = self._allowed_action_text()
                     check_message = f"""
                     You are a output checking assistant who is responsible for checking the output of another agent.
 
                     The output you received is: {decision_action}
 
                     Your should just output the right int type of action_id, with no other characters or delimiters.
-                    i.e. :
-                    | Action_id | Action Description                                     |
-                    |--------|--------------------------------------------------------|
-                    | 0      | Turn-left: change lane to the left of the current lane |
-                    | 1      | IDLE: remain in the current lane with current speed   |
-                    | 2      | Turn-right: change lane to the right of the current lane|
-                    | 3      | Acceleration: accelerate the vehicle                 |
-                    | 4      | Deceleration: decelerate the vehicle                 |
+                    Valid actions are:
+                    {action_table}
 
+                    Use only one of these action ids: {allowed_actions}
 
                     You answer format would be:
-                    {delimiter} <correct action_id within 0-4>
+                    {delimiter} <correct action_id>
                     """
                     messages = [
                         HumanMessage(content=check_message),
@@ -847,29 +924,26 @@ class DriverAgent:
 
                     tail = check_text.split(delimiter)[-1].strip() if delimiter in check_text else check_text
                     try:
-                        result = int(tail)
-                        if result < 0 or result > 4:
-                            raise ValueError
+                        result = self._extract_valid_action_from_text(tail)
                         decision_meta["parse_mode"] = "checker_direct"
                     except ValueError:
-                        matches = ACTION_RECOVERY_PATTERN.findall(check_text)
-                        if matches:
-                            result = int(matches[-1])
+                        try:
+                            result = self._extract_valid_action_from_text(check_text)
                             decision_meta["parse_mode"] = "checker_regex_recovered"
                             self._log_step(f"[yellow]Recovered action from checker output:[/yellow] {result}")
-                        else:
-                            any_matches = ACTION_ANYWHERE_PATTERN.findall(check_text)
-                            if any_matches:
-                                result = int(any_matches[-1])
+                        except ValueError:
+                            try:
+                                result = self._extract_valid_action_from_text(check_text)
                                 decision_meta["parse_mode"] = "checker_loose_recovered"
                                 self._log_step(f"[yellow]Recovered action from loose parse:[/yellow] {result}")
-                            else:
-                                # Safety-first fallback for driving.
-                                result = 4
+                            except ValueError:
+                                result = fallback_action_id
                                 decision_meta["used_fallback"] = True
                                 decision_meta["fallback_reason"] = "checker_fallback"
                                 decision_meta["parse_mode"] = "checker_fallback"
-                                self._log_step("[red]Checker output parse failed. Falling back to safe action 4 (Deceleration).[/red]")
+                                self._log_step(
+                                    f"[red]Checker output parse failed. Falling back to safe action {fallback_action_id}.[/red]"
+                                )
 
         few_shot_answers_store = ""
         for i in range(len(fewshot_messages)):

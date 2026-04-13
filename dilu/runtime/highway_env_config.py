@@ -194,9 +194,19 @@ def build_native_highway_env_config(
     render_agent: bool,
     lanes_count: int = 4,
     action_target_speeds_override: Optional[Any] = None,
+    require_discrete_meta_action: bool = False,
 ) -> Dict[str, Any]:
     probe = gym.make(env_id)
     env_cfg = dict(probe.unwrapped.config)
+    action_cfg_probe = dict(env_cfg.get("action") or {})
+    if require_discrete_meta_action:
+        action_type_name = str(action_cfg_probe.get("type") or "").strip()
+        if action_type_name != "DiscreteMetaAction":
+            probe.close()
+            raise ValueError(
+                f"unsupported continuous or non-DiscreteMetaAction env '{env_id}' "
+                f"(action.type={action_type_name or 'unknown'}) for the current DiLu discrete framework"
+            )
     probe.close()
 
     resolved_lanes_count = int(config.get("lanes_count", lanes_count))
@@ -255,6 +265,7 @@ def resolve_simulation_env_bundle(
     native_env_defaults_override: Optional[bool] = None,
     lanes_count: int = 4,
     action_target_speeds_override: Optional[Any] = None,
+    require_discrete_meta_action: bool = False,
 ) -> Dict[str, Any]:
     mode = resolve_simulation_env_mode(
         config,
@@ -272,6 +283,7 @@ def resolve_simulation_env_bundle(
             render_agent=render_agent,
             lanes_count=lanes_count,
             action_target_speeds_override=action_target_speeds_override,
+            require_discrete_meta_action=require_discrete_meta_action,
         )
         resolved_action_target_speeds = _normalize_action_target_speeds(
             (env_cfg.get("action") or {}).get("target_speeds")
