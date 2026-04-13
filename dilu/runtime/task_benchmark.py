@@ -9,6 +9,7 @@ import numpy as np
 
 
 DEFAULT_BENCHMARK_CASE_SET = "lampilot_highway_v1"
+DEFAULT_TARGET_ENV_ID = "highway-fast-v0"
 BENCHMARK_TTC_SAFE_THRESHOLD_SEC = 2.0
 BENCHMARK_SPEED_STD_SAFE_MPS = 4.0
 BENCHMARK_OVERALL_WEIGHTS = {
@@ -61,6 +62,17 @@ _ALLOWED_DIFFICULTIES = {"easy", "medium", "hard"}
 
 def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _infer_scenario_family_from_env_id(env_id: str) -> str:
+    text = str(env_id or "").strip().lower()
+    if text.startswith("merge-"):
+        return "merge"
+    if text.startswith("intersection-"):
+        return "intersection"
+    if text.startswith("parking-"):
+        return "parking"
+    return "highway"
 
 
 def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,11 +171,15 @@ def load_benchmark_case_set(identifier: str) -> Dict[str, Any]:
 
     categories = sorted({case["category"] for case in normalized_cases})
     benchmark_name = str(raw.get("benchmark_name") or os.path.basename(os.path.dirname(case_set_path)) or DEFAULT_BENCHMARK_CASE_SET)
+    target_env_id = str(raw.get("target_env_id") or DEFAULT_TARGET_ENV_ID).strip() or DEFAULT_TARGET_ENV_ID
+    scenario_family = str(raw.get("scenario_family") or _infer_scenario_family_from_env_id(target_env_id)).strip().lower()
     return {
         "benchmark_name": benchmark_name,
         "case_set_path": case_set_path,
         "version": str(raw.get("version") or "1.0"),
         "description": str(raw.get("description") or "").strip(),
+        "target_env_id": target_env_id,
+        "scenario_family": scenario_family,
         "defaults": defaults,
         "categories": categories,
         "cases": normalized_cases,
@@ -208,14 +224,19 @@ def build_benchmark_instruction(case: Dict[str, Any]) -> str:
     )
 
 
-def benchmark_metric_config() -> Dict[str, Any]:
+def benchmark_metric_config(scenario_family: str = "highway") -> Dict[str, Any]:
+    scenario_family = str(scenario_family or "highway").strip().lower()
+    recommended_headline_metric = (
+        BENCHMARK_RECOMMENDED_HEADLINE_METRIC if scenario_family == "highway" else "driving_score"
+    )
     return {
         "ttc_safe_threshold_sec": BENCHMARK_TTC_SAFE_THRESHOLD_SEC,
         "speed_std_safe_mps": BENCHMARK_SPEED_STD_SAFE_MPS,
         "overall_weights": dict(BENCHMARK_OVERALL_WEIGHTS),
         "driving_score_formula": "0 if crashed else completion_rate * overall_score",
         "benchmark_scoring_policy_version": BENCHMARK_SCORING_POLICY_VERSION,
-        "recommended_headline_metric": BENCHMARK_RECOMMENDED_HEADLINE_METRIC,
+        "recommended_headline_metric": recommended_headline_metric,
+        "scenario_family": scenario_family,
         "behavior_aware_v2": {
             "formula": "overall_score_v2 = overall_score * (1 - conservative_penalty_severity_v2) * (1 - runtime_penalty_severity_v2); driving_score_v2 = driving_score * (1 - conservative_penalty_severity_v2) * (1 - runtime_penalty_severity_v2)",
             "category_groups": {
@@ -295,6 +316,8 @@ def compute_behavior_aware_penalty_v2(
 
 def augment_behavior_aware_benchmark_episode(episode: Dict[str, Any]) -> Dict[str, Any]:
     if "task_completed" not in episode:
+        return dict(episode)
+    if str(episode.get("scenario_family") or "highway").strip().lower() != "highway":
         return dict(episode)
 
     scored = dict(episode)
@@ -439,6 +462,21 @@ def validate_benchmark_case(case: Dict[str, Any], initial_state: Dict[str, Any])
         elif not initial_state.get("initial_front_vehicle_is_ahead"):
             reasons.append("initial_front_vehicle_not_ahead")
 
+    elif criteria_type == "merge_complete":
+        lane_rank = initial_state.get("initial_lane_rank")
+        target_offset = _resolve_direction_offset(criteria)
+        if target_offset == 0:
+            reasons.append("invalid_target_lane_offset")
+        elif target_offset < 0 and not initial_state.get("can_change_left"):
+            reasons.append("target_left_lane_unavailable")
+        elif target_offset > 0 and not initial_state.get("can_change_right"):
+            reasons.append("target_right_lane_unavailable")
+        elif lane_rank is None:
+            reasons.append("missing_initial_lane_rank")
+
+    elif criteria_type == "arrive":
+        pass
+
     else:
         reasons.append(f"unsupported_success_criteria_type:{criteria_type or 'missing'}")
 
@@ -450,6 +488,12 @@ def validate_benchmark_case_set(
     base_env_config_map: Dict[str, Dict[str, Any]],
     env_type: str,
 ) -> Dict[str, Any]:
+    target_env_id = str(case_set.get("target_env_id") or "").strip()
+    if target_env_id and target_env_id != str(env_type):
+        raise ValueError(
+            f"Benchmark case set {case_set.get('benchmark_name')!r} targets env_id={target_env_id!r}, "
+            f"but evaluation resolved env_id={env_type!r}."
+        )
     invalid_cases: List[Dict[str, Any]] = []
     valid_cases: List[Dict[str, Any]] = []
 
@@ -747,6 +791,7 @@ class BenchmarkEpisodeEvaluator:
         self.time_limit_sec = float(case.get("time_limit_sec") or 0.0)
         self.difficulty = str(case.get("difficulty") or "medium")
         self.case_group = str(case.get("case_group") or self.category)
+        self.scenario_family = str(case.get("scenario_family") or _infer_scenario_family_from_env_id(getattr(env.unwrapped, "spec", None).id if getattr(getattr(env.unwrapped, "spec", None), "id", None) else "") or "highway")
 
         uenv = env.unwrapped
         env_cfg = dict(getattr(uenv, "config", {}) or {})
@@ -784,6 +829,7 @@ class BenchmarkEpisodeEvaluator:
         self.front_gap_history: List[float] = []
         self.min_positive_ttc_sec = None
         self.max_progress_m = 0.0
+        self.last_info: Dict[str, Any] = {}
 
     def _completion_predicate(self, env, step_metrics: Dict[str, Any]) -> bool:
         ego = getattr(env.unwrapped, "vehicle", None)
@@ -829,10 +875,28 @@ class BenchmarkEpisodeEvaluator:
             pass_margin_m = float(self.success_criteria.get("pass_margin_m", 5.0))
             return bool(used_required_lane and target_x <= (ego_x - pass_margin_m))
 
+        if criteria_type == "merge_complete":
+            if lane_rank is None or self.initial_lane_rank is None:
+                return False
+            target_offset = _resolve_direction_offset(self.success_criteria)
+            target_lane_rank = self.initial_lane_rank + target_offset
+            min_progress_m = float(self.success_criteria.get("min_progress_m", 0.0) or 0.0)
+            return lane_rank == target_lane_rank and float(self.max_progress_m) >= min_progress_m
+
+        if criteria_type == "arrive":
+            has_arrived = getattr(env.unwrapped, "has_arrived", None)
+            if callable(has_arrived) and ego is not None:
+                try:
+                    return bool(has_arrived(ego))
+                except TypeError:
+                    return bool(has_arrived())
+            return bool((self.last_info or {}).get("is_success"))
+
         return False
 
-    def update(self, env, step_idx: int, step_metrics: Dict[str, Any], crashed: bool) -> None:
+    def update(self, env, step_idx: int, step_metrics: Dict[str, Any], crashed: bool, info: Optional[Dict[str, Any]] = None) -> None:
         ego = getattr(env.unwrapped, "vehicle", None)
+        self.last_info = dict(info or {})
         lane_rank = _lane_rank(ego)
         if lane_rank is not None and self.initial_lane_rank is not None:
             if lane_rank < self.initial_lane_rank:
@@ -898,6 +962,7 @@ class BenchmarkEpisodeEvaluator:
             "case_id": self.case_id,
             "instruction": self.instruction,
             "category": self.category,
+            "scenario_family": self.scenario_family,
             "tags": list(self.case.get("tags") or []),
             "difficulty": self.difficulty,
             "case_group": self.case_group,

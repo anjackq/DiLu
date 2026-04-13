@@ -1,3 +1,10 @@
+"""Compatibility shim for legacy benchmark energy CLI usage.
+
+Prefer ``evaluate_models_ollama.py`` for new runs. This script remains only to
+forward older command lines onto the canonical evaluation entrypoint with the
+expected benchmark measurement defaults.
+"""
+
 import sys
 from typing import List, Optional
 

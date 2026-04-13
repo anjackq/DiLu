@@ -2,9 +2,45 @@
 
 Local-first DiLu fork for autonomous driving simulation, model benchmarking, and fine-tuning with Ollama models.
 
+## Overview
+
+DiLu-Ollama is a local-first research framework for evaluating and adapting language-model driving agents in `highway-env` with Ollama-hosted models. The project started from a practical problem: local LLM driving experiments are easy to run informally, but hard to compare rigorously once runtime instability, timeout collapse, model scale, and benchmark reporting begin to interact. This repository turns that workflow into a reproducible benchmark and analysis pipeline.
+
+The core evaluation path uses the DiLu decision loop with a task-conditioned LaMPilot-style highway benchmark, report merging, tiered model studies, and publication-facing analysis bundles. Around that core, the repo also supports fine-tuning workflows and a discrete cross-scenario extension for `highway-fast-v0`, `merge-v0`, and `intersection-v0`, while explicitly treating continuous-control settings such as `parking-v0` as out of scope for the current action interface.
+
+The current evidence base is intentionally reported conservatively. In the three-tier highway study, the lightweight tier provides the strongest usable comparison set, the midclass tier remains screening-quality because several runs are still invalid, and the highclass tier currently functions mainly as a runtime-scalability result because all tested 14B models failed ranking eligibility under the present local timeout policy. The framework therefore supports not only model comparison, but also diagnosis of when benchmark validity breaks down as model size and latency increase.
+
+In that form, DiLu-Ollama is both an experimental framework and a manuscript-oriented analysis workflow: it can run local driving simulations, benchmark base and fine-tuned models, summarize tier-level evidence, extend evaluation across compatible discrete scenarios, and generate publication-ready figures and tables from the resulting study artifacts.
+
 Primary workflows in this repo:
 - Simulation and benchmarking: `evaluate_models_ollama.py`
 - Fine-tuning pipeline: `fine_tuning/run_pipeline.py`
+
+Project status:
+- the core benchmark, study, cross-scenario, and publication-bundle pipeline is complete
+- generated study/publication outputs under `analysis/out/` are local artifacts and are not tracked
+- compatibility shims remain available intentionally for transition use, but the entrypoints listed below are the supported surface
+
+Supported entrypoints:
+- `evaluate_models_ollama.py`
+- `merge_eval_reports.py`
+- `plot_eval_compare.py`
+- `analysis/slm_study.py`
+- `analysis/cross_scenario_study.py`
+- `analysis/publication_three_tier_results.py`
+
+## Results Snapshot
+
+The current manuscript-facing snapshot is generated from the three-tier highway benchmark bundle under `analysis/out/publication_three_tier_results_v1/`.
+
+<p align="center">
+  <img src="assets/publication_three_tier_pareto.png" alt="Cross-tier Pareto view for current three-tier results" width="48%" />
+  <img src="assets/publication_three_tier_validity.png" alt="Cross-tier validity summary for current three-tier results" width="48%" />
+</p>
+
+<p align="center">
+  <em>Left: driving-score versus latency Pareto view across ranking-eligible models. Right: validity summary showing that lightweight is the strongest usable evidence tier under the current local runtime policy.</em>
+</p>
 
 ## Quick Start
 
@@ -167,7 +203,6 @@ python evaluate_models_ollama.py --models qwen3:1.7b dilu-qwen3-1_7b-v1 --benchm
 
 `evaluate_models_ollama.py` is now the canonical entrypoint for both standard evaluation and measurement mode.
 `benchmark_energy_latency.py` still works for one transition cycle, but only as a compatibility shim.
-
 LaMPilot benchmark runs are the canonical path for task quality, latency, and optional hardware energy reporting.
 Measurement mode reuses the same closed-loop driving evaluator, but adds:
 - end-to-end episode runtime
@@ -385,6 +420,8 @@ Outputs are written under `analysis/out/<study_id>/`:
 - `study_report.md`
 - plots under `analysis/out/<study_id>/plots/`
 
+These folders are generated analysis artifacts. Keep them locally for writing and comparison, but treat them as derived outputs rather than source-of-truth code.
+
 Targeted rerun workflow for invalid lightweight rows:
 - use `config.lightweight_rerun.yaml` to relax timeout containment for reruns without changing the benchmark or scoring
 - rerun only the invalid lightweight models under the same `lampilot_highway_v1` case set
@@ -401,6 +438,75 @@ The refreshed `study_report.md` now includes:
 - valid ranking conclusions
 - incomplete family conclusions
 - remaining invalid models
+
+## Cross-Scenario Discrete Benchmarks
+
+Built-in case sets now cover three discrete highway-env families:
+- `lampilot_highway_v1` -> `highway-fast-v0`
+- `lampilot_merge_v1` -> `merge-v0`
+- `lampilot_intersection_v1` -> `intersection-v0`
+
+Run one environment per benchmark job:
+
+```bash
+python evaluate_models_ollama.py --config config.yaml --env-id merge-v0 --benchmark-case-set lampilot_merge_v1 --models qwen3:4b --experiment-id merge_smoke --progress
+python evaluate_models_ollama.py --config config.yaml --env-id intersection-v0 --benchmark-case-set lampilot_intersection_v1 --models qwen3:4b --experiment-id intersection_smoke --progress
+```
+
+Notes:
+- the discrete framework now rejects unsupported continuous-control envs such as `parking-v0`
+- `merge-v0` is exposed by highway-env as a fixed-layout merge setup, so `lampilot_merge_v1` uses protocol-sliced merge tasks rather than pretending the native env provides rich procedurally varied traffic families
+- highway remains the only scenario using `driving_score_v2` as the headline metric; merge and intersection keep scenario-local task metrics without reusing the highway behavior-aware scalar
+
+For post-hoc cross-scenario synthesis, use `analysis/cross_scenario_study.py`:
+
+```bash
+python analysis/cross_scenario_study.py --registry analysis/slm_model_registry.csv --scenario-report highway=results/energy_benchmarks/highway_run/compare/energy_latency_compare_<timestamp>.json --scenario-report merge=results/energy_benchmarks/merge_run/compare/energy_latency_compare_<timestamp>.json --scenario-report intersection=results/energy_benchmarks/intersection_run/compare/energy_latency_compare_<timestamp>.json --study-id lampilot_cross_scenario_demo
+```
+
+## Publication Bundle
+
+For a publication-facing summary of the current three-tier LaMPilot results, use `analysis/publication_three_tier_results.py`:
+
+```bash
+python analysis/publication_three_tier_results.py --lightweight-study-dir analysis/out/slm_lightweight_stage1_refreshed --midclass-study-dir analysis/out/slm_midclass_stage1_study --highclass-study-dir analysis/out/slm_highclass_stage1_study --bundle-id publication_three_tier_results_v1
+```
+
+This bundle writes generated manuscript-facing assets under `analysis/out/<bundle_id>/`, including:
+- evidence summary memo
+- cross-tier validity table
+- lightweight leaderboard and exact-pair table
+- midclass screening summary
+- highclass failure summary
+- figure plan, caption bank, and results outline
+
+Representative current result figure:
+
+![Cross-tier Pareto view for current three-tier results](assets/publication_three_tier_pareto.png)
+
+The tracked README figure is a snapshot copied from the generated publication bundle. Regenerate the bundle under `analysis/out/` for the latest manuscript-facing assets; do not edit the tracked image by hand.
+
+## Compatibility and Developer Utilities
+
+These paths remain available, but they are not the primary supported workflow:
+- `benchmark_energy_latency.py`: compatibility shim forwarding old benchmark energy commands to `evaluate_models_ollama.py`
+- `config.stop_ablation.yaml`: deprecated alias equivalent to the canonical stop-capable `config.yaml`
+- `config.lightweight_rerun.yaml`: rerun-only timeout relaxation profile for targeted invalid-row recovery
+- `memory_check.py`: developer utility for inspecting local memory stores and embedding alignment
+- `visualize_results.py`: developer utility for replaying and annotating stored result traces
+- `fix_format.py`: one-off developer utility for local adapter conversion
+
+## Maintenance Notes
+
+- Treat tracked code, configs, benchmarks, and registry files as source-of-truth project assets.
+- Treat `analysis/out/` and experiment roots under ignored folders as generated outputs that should be regenerated rather than hand-maintained.
+- When adding a new base/fine-tuned model pair, update `analysis/slm_model_registry.csv` before running a tier study.
+- Before publishing new analysis conclusions, rerun the focused verification suite:
+  - `tests.test_publication_three_tier_results`
+  - `tests.test_slm_study`
+  - `tests.test_cross_scenario_study`
+  - `tests.test_plot_eval_compare`
+  - `tests.test_cli_merge`
 
 ## Troubleshooting (Short)
 

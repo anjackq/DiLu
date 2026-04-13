@@ -649,6 +649,7 @@ def setup_env(
         render_agent=True,
         env_id_override=env_id_override,
         native_env_defaults_override=native_env_defaults_override,
+        require_discrete_meta_action=True,
     )
     for warning_msg in env_bundle.get("warnings", []):
         print(f"[yellow]{warning_msg}[/yellow]")

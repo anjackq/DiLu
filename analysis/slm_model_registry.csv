@@ -27,5 +27,7 @@ qwen3_5_9b_base,Qwen3.5 9B Base,qwen3.5:9b,qwen,base,,9.0,midclass,installed_loc
 dilu_deepseek_r1_8b_v1,DiLu DeepSeek R1 8B v1,dilu-deepseek-r1-8b-v1,deepseek,fine_tuned,deepseek_r1_8b_base,8.0,midclass,installed_local_pairing_from_name_and_metadata
 dilu_llama3_1_8b_v1,DiLu Llama 3.1 8B v1,dilu-llama3_1-8b-v1,llama,fine_tuned,llama3_1_8b_base,8.0,midclass,installed_local_pairing_from_name_and_metadata
 deepseek_r1_14b_base,DeepSeek R1 14B Base,deepseek-r1:14b,deepseek,base,,14.0,highclass,installed_local
+dilu_deepseek_r1_14b_v1,DiLu DeepSeek R1 14B v1,dilu-deepseek-r1-14b-v1,deepseek,fine_tuned,deepseek_r1_14b_base,14.0,highclass,installed_local_pairing_from_name_and_metadata
 dilu_deepseek_r1_14b_v1_gguf,DiLu DeepSeek R1 14B v1 GGUF,dilu-deepseek-r1-14b-v1-gguf,deepseek,fine_tuned,deepseek_r1_14b_base,14.0,highclass,artifact_only_not_installed_gguf
 qwen3_14b_base,Qwen3 14B Base,qwen3:14b,qwen,base,,14.0,highclass,installed_local
+dilu_qwen3_14b_v1,DiLu Qwen3 14B v1,dilu-qwen3-14b-v1,qwen,fine_tuned,qwen3_14b_base,14.0,highclass,installed_local_pairing_from_name_and_metadata

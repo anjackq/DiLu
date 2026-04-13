@@ -92,6 +92,7 @@ def build_env_bundle(
         env_id_override=env_id_override,
         native_env_defaults_override=native_env_defaults_override,
         action_target_speeds_override=action_target_speeds_override,
+        require_discrete_meta_action=True,
     )
 
 
@@ -1273,6 +1274,7 @@ def run_episode(
                     step_idx=int(steps),
                     step_metrics=step_metrics,
                     crashed=crashed,
+                    info=info,
                 )
 
             if enable_db_logging or save_artifacts:
@@ -2479,7 +2481,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         "openai_api_type": config["OPENAI_API_TYPE"],
         "benchmark_mode": bool(benchmark_mode),
         "headline_task_metric": (
-            benchmark_metric_config().get("recommended_headline_metric")
+            benchmark_metric_config(
+                benchmark_case_set.get("scenario_family") if benchmark_case_set is not None else "highway"
+            ).get("recommended_headline_metric")
             if benchmark_mode
             else None
         ),
@@ -2579,7 +2583,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             "benchmark_categories": (
                 list(benchmark_case_set["categories"]) if benchmark_case_set is not None else []
             ),
-            "benchmark_metric_config": benchmark_metric_config() if benchmark_mode else None,
+            "benchmark_metric_config": (
+                benchmark_metric_config(
+                    benchmark_case_set.get("scenario_family") if benchmark_case_set is not None else "highway"
+                )
+                if benchmark_mode
+                else None
+            ),
             "benchmark_validation_passed": (
                 bool(benchmark_validation.get("passed")) if benchmark_validation is not None else None
             ),
