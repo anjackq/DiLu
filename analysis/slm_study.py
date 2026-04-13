@@ -1164,8 +1164,10 @@ def run_study(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Post-hoc tiered SLM study pipeline for LaMPilot compare reports.")
-    parser.add_argument("--registry", required=True, help="CSV registry describing model tier and lineage metadata.")
+    parser = argparse.ArgumentParser(
+        description="Generate a tiered LaMPilot study bundle from existing compare reports."
+    )
+    parser.add_argument("--registry", required=True, help="CSV model registry with tier and lineage metadata.")
     parser.add_argument(
         "--compare-report",
         action="append",
@@ -1176,22 +1178,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--experiment-root",
         action="append",
         default=[],
-        help="Experiment root containing compare/*.json reports. May be supplied multiple times.",
+        help="Experiment root containing compare/*.json reports. Repeatable.",
     )
     parser.add_argument(
         "--refresh-compare-report",
         action="append",
         default=[],
-        help="Optional rerun compare JSON used to supersede currently invalid screening rows.",
+        help="Optional rerun compare JSON used to supersede currently invalid screening rows. Repeatable.",
     )
     parser.add_argument(
         "--finalist-energy-report",
         action="append",
         default=[],
-        help="Optional finalist-stage compare JSON with hardware energy metrics. May be supplied multiple times.",
+        help="Optional finalist-stage compare JSON with hardware energy metrics. Repeatable.",
     )
-    parser.add_argument("--output-root", default="analysis/out", help="Directory where study outputs will be written.")
-    parser.add_argument("--study-id", required=True, help="Unique identifier for the study output folder.")
+    parser.add_argument("--output-root", default="analysis/out", help="Generated study output directory.")
+    parser.add_argument("--study-id", required=True, help="Output folder name under --output-root.")
     parser.add_argument(
         "--refresh-tier",
         default="lightweight",

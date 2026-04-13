@@ -1,3 +1,9 @@
+"""Developer utility for converting a local adapter safetensors file to .bin.
+
+This script is a one-off maintenance helper and is not part of the supported
+training or evaluation entrypoints documented in the main README.
+"""
+
 import torch
 from safetensors.torch import load_file
 import os

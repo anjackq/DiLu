@@ -1,3 +1,10 @@
+"""Developer utility for replaying and annotating stored DiLu result traces.
+
+This Gradio app is intentionally kept outside the primary benchmark, study, and
+publication workflows. Use it when manually inspecting frames or committing
+corrected experiences back into a memory database.
+"""
+
 import re
 from rich import print
 import gradio as gr

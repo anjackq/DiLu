@@ -780,7 +780,7 @@ def run_publication_bundle(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build a publication-facing three-tier analysis bundle from existing study outputs."
+        description="Generate a publication-facing three-tier analysis bundle from existing study outputs."
     )
     parser.add_argument(
         "--lightweight-study-dir",
@@ -800,12 +800,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-root",
         default="analysis/out",
-        help="Directory under which the publication bundle should be created.",
+        help="Generated analysis output directory.",
     )
     parser.add_argument(
         "--bundle-id",
         default="publication_three_tier_results_v1",
-        help="Name of the output publication bundle directory.",
+        help="Output folder name under --output-root.",
     )
     return parser
 

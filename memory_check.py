@@ -1,3 +1,10 @@
+"""Developer utility for inspecting the current driving memory database.
+
+This script is not part of the canonical benchmark or study pipeline. It is
+useful when validating embedding/provider alignment and checking whether a
+memory store is populated.
+"""
+
 import yaml
 from rich import print
 from dilu.driver_agent.vectorStore import DrivingMemory

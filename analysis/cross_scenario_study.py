@@ -761,17 +761,17 @@ def run_cross_scenario_study(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Cross-scenario study pipeline for highway, merge, and intersection compare reports."
+        description="Generate a cross-scenario study bundle from highway, merge, and intersection compare reports."
     )
-    parser.add_argument("--registry", required=True, help="CSV registry describing model metadata.")
+    parser.add_argument("--registry", required=True, help="CSV model registry with tier and lineage metadata.")
     parser.add_argument(
         "--scenario-report",
         action="append",
         default=[],
         help="Scenario compare report in the form <scenario>=<path>. Repeatable.",
     )
-    parser.add_argument("--output-root", default="analysis/out", help="Directory for study outputs.")
-    parser.add_argument("--study-id", required=True, help="Unique output folder name.")
+    parser.add_argument("--output-root", default="analysis/out", help="Generated study output directory.")
+    parser.add_argument("--study-id", required=True, help="Output folder name under --output-root.")
     return parser
 
 
