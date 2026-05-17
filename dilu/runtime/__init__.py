@@ -17,6 +17,7 @@ from .constants import DEFAULT_DILU_SEEDS
 from .task_benchmark import (
     DEFAULT_BENCHMARK_CASE_SET,
     load_benchmark_case_set,
+    build_benchmark_case_set_fingerprint,
     build_case_env_config,
     benchmark_max_steps,
     build_benchmark_instruction,
@@ -77,6 +78,7 @@ __all__ = [
     "DEFAULT_DILU_SEEDS",
     "DEFAULT_BENCHMARK_CASE_SET",
     "load_benchmark_case_set",
+    "build_benchmark_case_set_fingerprint",
     "build_case_env_config",
     "benchmark_max_steps",
     "build_benchmark_instruction",

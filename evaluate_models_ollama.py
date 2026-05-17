@@ -52,6 +52,7 @@ from dilu.runtime import (
     read_json,
     DEFAULT_BENCHMARK_CASE_SET,
     load_benchmark_case_set,
+    build_benchmark_case_set_fingerprint,
     build_case_env_config,
     benchmark_max_steps,
     build_benchmark_instruction,
@@ -77,6 +78,8 @@ from dilu.scenario.envScenario import EnvScenario
 STRICT_RESPONSE_PATTERN = re.compile(r"Response to user:\s*\#{4}\s*([0-4])\s*$", re.IGNORECASE)
 STOP_THRESHOLD_MPS_DEFAULT = 0.5
 NEAR_STOP_THRESHOLD_MPS_DEFAULT = 2.0
+LEGACY_BENCHMARK_VARIANT = "legacy_direct_action"
+LEGACY_EXECUTION_MODE = "direct_action_loop"
 
 
 def build_env_bundle(
@@ -1818,6 +1821,7 @@ def _build_model_extract(
     episodes: List[Dict],
     metrics_config: Dict,
 ) -> Dict:
+    benchmark_mode = bool(metrics_config.get("benchmark_mode"))
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "report_schema_version": "2.0",
@@ -1828,6 +1832,15 @@ def _build_model_extract(
         "aggregate": aggregate,
         "episodes": episodes,
         "metrics_config": metrics_config,
+        "benchmark_mode": benchmark_mode,
+        "benchmark_case_set": metrics_config.get("benchmark_case_set") if benchmark_mode else None,
+        "benchmark_variant": metrics_config.get("benchmark_variant") if benchmark_mode else None,
+        "execution_mode": metrics_config.get("execution_mode") if benchmark_mode else None,
+        "benchmark_fingerprint": metrics_config.get("benchmark_fingerprint") if benchmark_mode else None,
+        "headline_task_metric": (
+            metrics_config.get("benchmark_metric_config", {}) or {}
+        ).get("recommended_headline_metric") if benchmark_mode else None,
+        "efficiency_metrics_reported": bool(aggregate.get("decision_latency_ms_avg_mean") is not None),
     }
 
 
@@ -2099,6 +2112,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     benchmark_case_set = None
     benchmark_cases: List[Dict] = []
     benchmark_mode = bool(args.benchmark_case_set)
+    benchmark_fingerprint = None
     if benchmark_mode:
         if args.seeds:
             raise ValueError("--seeds cannot be combined with --benchmark-case-set. Cases define their own seeds.")
@@ -2111,6 +2125,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         benchmark_case_set = dict(benchmark_case_set)
         benchmark_case_set["cases"] = list(benchmark_cases)
         benchmark_case_set["categories"] = sorted({case["category"] for case in benchmark_cases})
+        benchmark_fingerprint = build_benchmark_case_set_fingerprint(benchmark_case_set)
         seeds = [int(case["seed"]) for case in benchmark_cases]
     else:
         seeds = parse_seeds(args.seeds)
@@ -2491,6 +2506,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         "benchmark_case_set": (
             benchmark_case_set["benchmark_name"] if benchmark_case_set is not None else None
         ),
+        "benchmark_variant": (
+            LEGACY_BENCHMARK_VARIANT if benchmark_case_set is not None else None
+        ),
+        "execution_mode": (
+            LEGACY_EXECUTION_MODE if benchmark_case_set is not None else None
+        ),
+        "benchmark_fingerprint": benchmark_fingerprint if benchmark_case_set is not None else None,
         "benchmark_case_set_path": (
             benchmark_case_set["case_set_path"] if benchmark_case_set is not None else None
         ),
@@ -2577,6 +2599,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             "benchmark_case_set": (
                 benchmark_case_set["benchmark_name"] if benchmark_case_set is not None else None
             ),
+            "benchmark_variant": (
+                LEGACY_BENCHMARK_VARIANT if benchmark_case_set is not None else None
+            ),
+            "execution_mode": (
+                LEGACY_EXECUTION_MODE if benchmark_case_set is not None else None
+            ),
+            "benchmark_fingerprint": benchmark_fingerprint if benchmark_case_set is not None else None,
             "benchmark_case_set_path": (
                 benchmark_case_set["case_set_path"] if benchmark_case_set is not None else None
             ),

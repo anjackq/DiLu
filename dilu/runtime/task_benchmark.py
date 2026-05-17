@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -184,6 +185,36 @@ def load_benchmark_case_set(identifier: str) -> Dict[str, Any]:
         "categories": categories,
         "cases": normalized_cases,
     }
+
+
+def build_benchmark_case_set_fingerprint(case_set: Dict[str, Any]) -> str:
+    benchmark_name = str(case_set.get("benchmark_name") or DEFAULT_BENCHMARK_CASE_SET).strip()
+    normalized_cases = []
+    for case in case_set.get("cases") or []:
+        normalized_cases.append(
+            {
+                "case_id": str(case.get("case_id") or "").strip(),
+                "category": str(case.get("category") or "").strip(),
+                "instruction": str(case.get("instruction") or "").strip(),
+                "seed": int(case.get("seed") or 0),
+                "time_limit_sec": float(case.get("time_limit_sec") or 0.0),
+                "difficulty": str(case.get("difficulty") or "").strip().lower(),
+                "case_group": str(case.get("case_group") or "").strip(),
+                "env_overrides": copy.deepcopy(case.get("env_overrides") or {}),
+                "success_criteria": copy.deepcopy(case.get("success_criteria") or {}),
+            }
+        )
+    payload = {
+        "benchmark_name": benchmark_name,
+        "version": str(case_set.get("version") or ""),
+        "target_env_id": str(case_set.get("target_env_id") or DEFAULT_TARGET_ENV_ID).strip(),
+        "scenario_family": str(case_set.get("scenario_family") or "").strip().lower(),
+        "categories": list(case_set.get("categories") or []),
+        "case_count": len(normalized_cases),
+        "cases": normalized_cases,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return f"{benchmark_name}:{digest}"
 
 
 def build_case_env_config(

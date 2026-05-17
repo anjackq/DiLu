@@ -32,6 +32,9 @@ NORMALIZED_FIELDS = (
     "source_compare_report",
     "experiment_id",
     "benchmark_case_set",
+    "benchmark_variant",
+    "execution_mode",
+    "benchmark_fingerprint",
     "headline_task_metric",
     "efficiency_metrics_reported",
     "model_id",
@@ -268,6 +271,25 @@ def _ensure_lampilot_report(payload: dict[str, Any], report_path: Path) -> None:
     case_set = str(payload.get("benchmark_case_set") or "")
     if case_set != "lampilot_highway_v1":
         raise ValueError(f"{report_path} targets unsupported benchmark_case_set={case_set!r}")
+    metrics_config = payload.get("metrics_config", {}) or {}
+    benchmark_variant = str(
+        payload.get("benchmark_variant")
+        or metrics_config.get("benchmark_variant")
+        or ""
+    ).strip()
+    if benchmark_variant != "legacy_direct_action":
+        raise ValueError(
+            f"{report_path} must declare benchmark_variant='legacy_direct_action', got {benchmark_variant!r}"
+        )
+    execution_mode = str(
+        payload.get("execution_mode")
+        or metrics_config.get("execution_mode")
+        or ""
+    ).strip()
+    if execution_mode and execution_mode != "direct_action_loop":
+        raise ValueError(
+            f"{report_path} must declare execution_mode='direct_action_loop', got {execution_mode!r}"
+        )
     if payload.get("headline_task_metric") and payload.get("headline_task_metric") != "driving_score_v2":
         raise ValueError(f"{report_path} does not use driving_score_v2 as the headline task metric")
 
@@ -439,6 +461,9 @@ def _normalize_records(
                 "source_compare_report": str(report_path),
                 "experiment_id": payload.get("experiment_id") or report_path.stem,
                 "benchmark_case_set": payload.get("benchmark_case_set") or "",
+                "benchmark_variant": payload.get("benchmark_variant") or (payload.get("metrics_config", {}) or {}).get("benchmark_variant") or "",
+                "execution_mode": payload.get("execution_mode") or (payload.get("metrics_config", {}) or {}).get("execution_mode") or "",
+                "benchmark_fingerprint": payload.get("benchmark_fingerprint") or (payload.get("metrics_config", {}) or {}).get("benchmark_fingerprint") or "",
                 "headline_task_metric": payload.get("headline_task_metric") or "driving_score_v2",
                 "efficiency_metrics_reported": _to_bool(payload.get("efficiency_metrics_reported", True)),
                 "model_id": registry_row["model_id"],

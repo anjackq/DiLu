@@ -26,8 +26,16 @@ COMPAT_METRIC_KEYS = [
 
 def _infer_compare_metadata_from_summary(summary_payload: Dict) -> Dict:
     metrics_config = summary_payload.get("metrics_config", {}) or {}
-    benchmark_mode = bool(metrics_config.get("benchmark_mode"))
+    benchmark_mode = bool(metrics_config.get("benchmark_mode") or summary_payload.get("benchmark_mode"))
     benchmark_metric_config = metrics_config.get("benchmark_metric_config", {}) or {}
+    benchmark_case_set = metrics_config.get("benchmark_case_set") or summary_payload.get("benchmark_case_set")
+    benchmark_case_set_path = metrics_config.get("benchmark_case_set_path") or summary_payload.get("benchmark_case_set_path")
+    benchmark_categories = metrics_config.get("benchmark_categories")
+    if benchmark_categories is None:
+        benchmark_categories = summary_payload.get("benchmark_categories") or []
+    benchmark_variant = metrics_config.get("benchmark_variant") or summary_payload.get("benchmark_variant")
+    execution_mode = metrics_config.get("execution_mode") or summary_payload.get("execution_mode")
+    benchmark_fingerprint = metrics_config.get("benchmark_fingerprint") or summary_payload.get("benchmark_fingerprint")
     headline_task_metric = (
         benchmark_metric_config.get("recommended_headline_metric")
         or summary_payload.get("headline_task_metric")
@@ -35,11 +43,18 @@ def _infer_compare_metadata_from_summary(summary_payload: Dict) -> Dict:
     )
     return {
         "benchmark_mode": benchmark_mode,
-        "benchmark_case_set": metrics_config.get("benchmark_case_set"),
-        "benchmark_case_set_path": metrics_config.get("benchmark_case_set_path"),
-        "benchmark_categories": list(metrics_config.get("benchmark_categories") or []),
+        "benchmark_case_set": benchmark_case_set,
+        "benchmark_case_set_path": benchmark_case_set_path,
+        "benchmark_categories": list(benchmark_categories or []),
+        "benchmark_variant": benchmark_variant,
+        "execution_mode": execution_mode,
+        "benchmark_fingerprint": benchmark_fingerprint,
         "headline_task_metric": headline_task_metric,
-        "efficiency_metrics_reported": bool(summary_payload.get("aggregate", {}).get("decision_latency_ms_avg_mean") is not None),
+        "efficiency_metrics_reported": bool(
+            summary_payload.get("efficiency_metrics_reported")
+            if summary_payload.get("efficiency_metrics_reported") is not None
+            else summary_payload.get("aggregate", {}).get("decision_latency_ms_avg_mean") is not None
+        ),
     }
 
 
@@ -283,6 +298,7 @@ def _compat_profile(model_name: str, source: Dict, summary_payload: Dict, episod
     few_shot_num = manifest.get("few_shot_num")
     simulation_duration = manifest.get("simulation_duration")
     metrics_config = summary_payload.get("metrics_config", {}) or {}
+    compare_metadata = _infer_compare_metadata_from_summary(summary_payload)
     if few_shot_num is None:
         few_shot_num = metrics_config.get("few_shot_num")
     if simulation_duration is None and episodes:
@@ -302,6 +318,7 @@ def _compat_profile(model_name: str, source: Dict, summary_payload: Dict, episod
         "simulation_duration": int(simulation_duration),
         "seeds": seeds,
         "metrics_subset": metrics_subset,
+        "compare_metadata": compare_metadata,
     }
 
 
@@ -323,6 +340,22 @@ def _compare_profiles(base_model: str, base: Dict, model_name: str, candidate: D
         right = base["metrics_subset"].get(key)
         if left != right:
             diffs.append(f"metrics_config.{key} mismatch: {model_name}={left} vs {base_model}={right}")
+    compare_keys = (
+        "benchmark_mode",
+        "benchmark_case_set",
+        "benchmark_case_set_path",
+        "benchmark_categories",
+        "benchmark_variant",
+        "execution_mode",
+        "benchmark_fingerprint",
+        "headline_task_metric",
+        "efficiency_metrics_reported",
+    )
+    for key in compare_keys:
+        left = candidate["compare_metadata"].get(key)
+        right = base["compare_metadata"].get(key)
+        if left != right:
+            diffs.append(f"{key} mismatch: {model_name}={left} vs {base_model}={right}")
     return diffs
 
 

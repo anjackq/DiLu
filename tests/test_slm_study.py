@@ -180,6 +180,8 @@ def _screening_report():
     return {
         "benchmark_mode": True,
         "benchmark_case_set": "lampilot_highway_v1",
+        "benchmark_variant": "legacy_direct_action",
+        "execution_mode": "direct_action_loop",
         "headline_task_metric": "driving_score_v2",
         "efficiency_metrics_reported": True,
         "aggregates": [
@@ -268,6 +270,8 @@ def _finalist_energy_report():
     return {
         "benchmark_mode": True,
         "benchmark_case_set": "lampilot_highway_v1",
+        "benchmark_variant": "legacy_direct_action",
+        "execution_mode": "direct_action_loop",
         "headline_task_metric": "driving_score_v2",
         "efficiency_metrics_reported": True,
         "energy_mode_effective": "joulescope_hw",
@@ -313,6 +317,23 @@ class SlmStudyTests(unittest.TestCase):
             _write_json(report_path, payload)
 
             with self.assertRaisesRegex(ValueError, "missing:model"):
+                run_study(
+                    registry_path=registry_path,
+                    compare_report_paths=[report_path],
+                    output_root=os.path.join(tmpdir, "out"),
+                    study_id="study",
+                )
+
+    def test_run_study_rejects_non_legacy_benchmark_variant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry_path = os.path.join(tmpdir, "registry.csv")
+            report_path = os.path.join(tmpdir, "report.json")
+            _write_csv(registry_path, _registry_fieldnames(), _base_registry_rows())
+            payload = _screening_report()
+            payload["benchmark_variant"] = "port_policy_exec"
+            _write_json(report_path, payload)
+
+            with self.assertRaisesRegex(ValueError, "legacy_direct_action"):
                 run_study(
                     registry_path=registry_path,
                     compare_report_paths=[report_path],
@@ -412,6 +433,8 @@ class SlmStudyTests(unittest.TestCase):
                 {
                     "benchmark_mode": True,
                     "benchmark_case_set": "lampilot_highway_v1",
+                    "benchmark_variant": "legacy_direct_action",
+                    "execution_mode": "direct_action_loop",
                     "headline_task_metric": "driving_score_v2",
                     "efficiency_metrics_reported": True,
                     "aggregates": [
@@ -454,6 +477,8 @@ class SlmStudyTests(unittest.TestCase):
                 {
                     "benchmark_mode": True,
                     "benchmark_case_set": "lampilot_highway_v1",
+                    "benchmark_variant": "legacy_direct_action",
+                    "execution_mode": "direct_action_loop",
                     "headline_task_metric": "driving_score_v2",
                     "efficiency_metrics_reported": True,
                     "aggregates": [
@@ -519,6 +544,8 @@ class SlmStudyTests(unittest.TestCase):
                 {
                     "benchmark_mode": True,
                     "benchmark_case_set": "lampilot_highway_v1",
+                    "benchmark_variant": "legacy_direct_action",
+                    "execution_mode": "direct_action_loop",
                     "headline_task_metric": "driving_score_v2",
                     "efficiency_metrics_reported": True,
                     "aggregates": [

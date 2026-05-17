@@ -11,6 +11,7 @@ from evaluate_models_ollama import _apply_measurement_runtime_overrides
 from dilu.runtime import load_runtime_config
 from merge_eval_reports import (
     _compat_profile,
+    _compare_profiles,
     _discover_available_model_names,
     _discover_model_artifacts,
     _infer_compare_metadata_from_summary,
@@ -74,6 +75,9 @@ class CliMergeTests(unittest.TestCase):
                 "benchmark_case_set": "lampilot_highway_v1",
                 "benchmark_case_set_path": "benchmarks/lampilot_highway_v1/cases.json",
                 "benchmark_categories": ["speed_increase", "speed_decrease"],
+                "benchmark_variant": "legacy_direct_action",
+                "execution_mode": "direct_action_loop",
+                "benchmark_fingerprint": "lampilot_highway_v1:abc123",
                 "benchmark_metric_config": {
                     "recommended_headline_metric": "driving_score_v2",
                 },
@@ -84,8 +88,45 @@ class CliMergeTests(unittest.TestCase):
 
         self.assertTrue(metadata["benchmark_mode"])
         self.assertEqual(metadata["benchmark_case_set"], "lampilot_highway_v1")
+        self.assertEqual(metadata["benchmark_variant"], "legacy_direct_action")
+        self.assertEqual(metadata["execution_mode"], "direct_action_loop")
+        self.assertEqual(metadata["benchmark_fingerprint"], "lampilot_highway_v1:abc123")
         self.assertEqual(metadata["headline_task_metric"], "driving_score_v2")
         self.assertEqual(metadata["benchmark_categories"], ["speed_increase", "speed_decrease"])
+
+    def test_merge_eval_reports_rejects_cross_benchmark_variant_mixing(self):
+        legacy_summary = {
+            "aggregate": {"driving_score_v2": 0.1},
+            "metrics_config": {
+                "few_shot_num": 0,
+                "benchmark_mode": True,
+                "benchmark_case_set": "lampilot_highway_v1",
+                "benchmark_variant": "legacy_direct_action",
+                "execution_mode": "direct_action_loop",
+                "benchmark_fingerprint": "lampilot_highway_v1:legacy",
+            },
+        }
+        port_summary = {
+            "aggregate": {"task_success_rate": 0.5},
+            "metrics_config": {
+                "few_shot_num": 0,
+                "benchmark_mode": True,
+                "benchmark_case_set": "lampilot_highway_port_v1",
+                "benchmark_variant": "port_policy_exec",
+                "execution_mode": "programmatic_policy_exec",
+                "benchmark_fingerprint": "lampilot_highway_port_v1:port",
+            },
+        }
+        legacy_episodes = [{"seed": 1, "max_steps": 12}]
+        port_episodes = [{"seed": 1, "max_steps": 12}]
+
+        legacy_profile = _compat_profile("legacy", {"manifest": {}}, legacy_summary, legacy_episodes)
+        port_profile = _compat_profile("port", {"manifest": {}}, port_summary, port_episodes)
+        diffs = _compare_profiles("legacy", legacy_profile, "port", port_profile)
+
+        self.assertTrue(any("benchmark_case_set mismatch" in diff for diff in diffs))
+        self.assertTrue(any("benchmark_variant mismatch" in diff for diff in diffs))
+        self.assertTrue(any("benchmark_fingerprint mismatch" in diff for diff in diffs))
 
     def test_load_runtime_config_supports_relative_base_config_inheritance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
