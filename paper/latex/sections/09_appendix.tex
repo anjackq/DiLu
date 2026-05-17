@@ -1,0 +1,41 @@
+\section{Additional Screening Tables}
+
+\begin{table*}[h]
+\caption{Midclass model inventory. Valid rows retain their measured values, while invalid rows are shown with blank value fields so the missing exact eligible pairs remain explicit.}
+\label{tab:midclass-screening}
+\centering
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l l l r r}
+\toprule
+Family & Model & Kind & Status & \metric{driving\_score\_v2} & Latency (ms) \\
+\midrule
+DeepSeek & DeepSeek R1 8B Base & base & quarantined+incomplete+invalid &  &  \\
+DeepSeek & DiLu DeepSeek R1 8B v1 & fine-tuned & valid & 0.1130 & 5054.2 \\
+Llama & Llama 3.1 8B Base & base & valid & 0.0930 & 2329.5 \\
+Llama & DiLu Llama 3.1 8B v1 & fine-tuned & quarantined+incomplete+invalid &  &  \\
+Qwen & Qwen3 8B Base & base & quarantined+incomplete+invalid &  &  \\
+Qwen & DiLu Qwen3 8B v1 & fine-tuned & valid & 0.0915 & 1903.5 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\begin{table*}[h]
+\caption{Highclass model inventory. All 14B models are invalid under the current runtime regime, so only identity and status text are retained while value fields remain empty.}
+\label{tab:highclass-failure}
+\centering
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l l r r r r}
+\toprule
+Model & Variant & Status & \metric{driving\_score\_v2} & Completion & Crash & Mean latency (ms) \\
+\midrule
+DeepSeek R1 14B Base & base & quarantined+incomplete+invalid &  &  &  &  \\
+DiLu DeepSeek R1 14B v1 & fine-tuned & quarantined+incomplete+invalid &  &  &  &  \\
+DiLu Qwen3 14B v1 & fine-tuned & quarantined+incomplete+invalid &  &  &  &  \\
+Qwen3 14B Base & base & quarantined+incomplete+invalid &  &  &  &  \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

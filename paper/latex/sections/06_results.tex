@@ -1,0 +1,105 @@
+\section{Results}
+
+\subsection{Three-tier screening overview}
+
+The primary result is a validity gradient, not a leaderboard. Table~\ref{tab:validity-summary} shows that 7 of 14 lightweight models remain ranking-eligible, compared with 3 of 6 midclass models and 0 of 4 highclass models. Figure~\ref{fig:cross-tier-validity} makes the same pattern visually explicit: as model tier increases, the benchmark stops behaving like a stable ranking instrument and starts behaving like a runtime stress test. Fine-tuning cannot be interpreted independently of this screening structure, because strong pairwise conclusions are only possible inside the region where runs remain valid. Under the current local runtime policy, that region is concentrated in lightweight.
+
+\begin{table}[t]
+\caption{Cross-tier validity summary. This table reports ranking eligibility, not task quality alone, and defines where the benchmark supports ranking, screening only, or failure analysis.}
+\label{tab:validity-summary}
+\centering
+\small
+\begin{tabularx}{\linewidth}{lrrrrrl}
+\toprule
+Tier & Total & Valid & Invalid & Invalid frac. & Exact pairs & Interpretation \\
+\midrule
+Lightweight & 14 & 7 & 7 & 0.50 & 1 & results-ready \\
+Midclass & 6 & 3 & 3 & 0.50 & 0 & screening-only \\
+Highclass & 4 & 0 & 4 & 1.00 & 0 & failure-analysis-only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{cross_tier_validity.png}
+\caption{Cross-tier validity summary. The figure visualizes ranking eligibility rather than task quality alone; the central pattern is collapse of valid comparison at larger scale under the current local runtime policy.}
+\label{fig:cross-tier-validity}
+\end{figure}
+
+\subsection{Lightweight comparative evidence}
+
+Lightweight is the only tier where the benchmark supports both comparative ranking and exact pairwise interpretation. Table~\ref{tab:lightweight-leaderboard} shows that Llama 3.2 3B Base is the top valid lightweight model in the current bundle, reaching \metric{driving\_score\_v2}~=~0.1403 with a task completion rate of 0.35 at roughly 1196 ms mean decision latency. Several fine-tuned lightweight models also remain competitive, notably DiLu Qwen3 1.7B v1 and DiLu Phi-4 Mini 3.8B Instruct v1. For coverage transparency, the same table also lists invalid lightweight rows beneath the ranked block with metric cells left empty; those rows document benchmark reach, but only valid rows contribute to ranking and the Pareto view. Figure~\ref{fig:cross-tier-pareto} shows why this tier matters: the lightweight story is not only about peak score, but about occupying the only part of the latency-quality frontier where multiple local models remain both valid and interpretable. In practice, lightweight is the only tier where the benchmark still behaves like the comparative instrument the fine-tuning question requires.
+
+\begin{table*}[t]
+\caption{Lightweight model inventory ordered by valid-row rank. Ranking-eligible models appear first and define the comparative leaderboard; invalid rows are shown below for coverage transparency with non-identity value fields left empty.}
+\label{tab:lightweight-leaderboard}
+\centering
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{r l l l r r r r}
+\toprule
+Rank & Model & Variant & Status & \metric{driving\_score\_v2} & Completion & Crash & Latency (ms) \\
+\midrule
+1 & Llama 3.2 3B Base & base & valid & 0.1403 & 0.350 & 0.350 & 1196.2 \\
+2 & DiLu Qwen3 1.7B v1 & fine-tuned & valid & 0.1305 & 0.275 & 0.425 & 1502.8 \\
+3 & DiLu Phi-4 Mini 3.8B Instruct v1 & fine-tuned & valid & 0.1257 & 0.350 & 0.575 & 1215.9 \\
+4 & Llama 3.2 1B Base & base & valid & 0.0885 & 0.175 & 0.125 & 917.0 \\
+5 & Phi-4 Mini 3.8B & base & valid & 0.0838 & 0.425 & 0.750 & 1322.2 \\
+6 & DiLu DeepSeek R1 1.5B v3 & fine-tuned & valid & 0.0724 & 0.200 & 0.125 & 1519.6 \\
+7 & DiLu Qwen3 4B v1 & fine-tuned & valid & 0.0706 & 0.175 & 0.825 & 1019.6 \\
+\midrule
+\multicolumn{8}{l}{\textit{Invalid lightweight rows shown for coverage only; these rows do not contribute to ranking.}} \\
+\midrule
+ & DeepSeek R1 1.5B Base & base & quarantined+incomplete+invalid &  &  &  &  \\
+ & DiLu Llama 3.2 1B Instruct v1 & fine-tuned & quarantined+incomplete+invalid &  &  &  &  \\
+ & DiLu Llama 3.2 3B Instruct v1 & fine-tuned & quarantined+incomplete+invalid &  &  &  &  \\
+ & Phi-4 Mini Reasoning 3.8B & base & quarantined+incomplete+invalid &  &  &  &  \\
+ & DiLu Phi-4 Mini 3.8B Reasoning v1 & fine-tuned & quarantined+incomplete+invalid &  &  &  &  \\
+ & Qwen3 1.7B Base & base & quarantined+incomplete+invalid &  &  &  &  \\
+ & Qwen3 4B Base & base & quarantined+incomplete+invalid &  &  &  &  \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{cross_tier_pareto.png}
+\caption{Cross-tier Pareto view of task quality versus latency using ranking-eligible models only. Highclass contributes no valid frontier points under the current local runtime regime.}
+\label{fig:cross-tier-pareto}
+\end{figure}
+
+\subsection{Exact fine-tuning evidence in lightweight}
+
+The Phi family provides the only exact eligible fine-tuning comparison in the current paper. Table~\ref{tab:lightweight-pair-delta} now lists all attempted lightweight base-versus-fine-tuned pairs, making the blocked comparisons explicit rather than leaving them implicit. Only the Phi-4 Mini 3.8B pair retains measurable deltas: DiLu Phi-4 Mini 3.8B Instruct v1 improves \metric{driving\_score\_v2} by 0.0419 and \metric{overall\_score\_mean} by 0.1006 relative to the base model, while also reducing mean decision latency by about 106 ms. This matters because it clears the paper's strictest evidential bar: both sides of the comparison are ranking-eligible under the same local runtime regime. That makes the Phi pair more than an anecdote. It is direct evidence that fine-tuning can improve a local driving agent without paying an obvious latency penalty. At the same time, the empty delta rows define the limit of the claim. The paper can argue for a real lightweight fine-tuning effect, but it cannot generalize that effect across families that never become jointly rankable.
+
+\begin{table*}[t]
+\caption{Lightweight base-versus-fine-tuned pair inventory. All attempted lightweight pairs are shown; delta fields remain empty when the pair is not jointly ranking-eligible. Positive values favor the fine-tuned model except for latency, where negative is better.}
+\label{tab:lightweight-pair-delta}
+\centering
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l l l l r r r r}
+\toprule
+Family & Base model & Fine-tuned model & Eligible & Pair issue & $\Delta$ \metric{driving\_score\_v2} & $\Delta$ completion & $\Delta$ overall & $\Delta$ latency (ms) \\
+\midrule
+DeepSeek & DeepSeek R1 1.5B Base & DiLu DeepSeek R1 1.5B v3 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+Llama & Llama 3.2 1B Base & DiLu Llama 3.2 1B Instruct v1 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+Llama & Llama 3.2 3B Base & DiLu Llama 3.2 3B Instruct v1 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+Phi & Phi-4 Mini 3.8B & DiLu Phi-4 Mini 3.8B Instruct v1 & yes &  & +0.0419 & -0.0750 & +0.1006 & -106.3 \\
+Phi & Phi-4 Mini Reasoning 3.8B & DiLu Phi-4 Mini 3.8B Reasoning v1 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+Qwen & Qwen3 1.7B Base & DiLu Qwen3 1.7B v1 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+Qwen & Qwen3 4B Base & DiLu Qwen3 4B v1 & no & base\_or\_fine\_tuned\_not\_rankable &  &  &  &  \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\subsection{Midclass screening results}
+
+Midclass is useful, but only as screening evidence. The best valid midclass model is DiLu DeepSeek R1 8B v1 with \metric{driving\_score\_v2}~=~0.1130, and Table~\ref{tab:midclass-screening} shows the full six-model inventory rather than only family-best survivors. Invalid rows are retained with blank value cells so that the missing exact eligible pairs remain explicit at the row level rather than being hidden inside aggregate summaries. The right interpretation is therefore not that midclass is uninformative, but that it reveals partial viability without clean causal comparison. Some 8B models can survive the benchmark and produce meaningful scores, yet the tier as a whole remains too brittle for the paper to claim a family-level fine-tuning effect. The benchmark is actively showing where interpretation stops being secure.
+
+\subsection{Highclass failure analysis}
+
+Highclass is not a failed leaderboard; it is a failure-analysis regime. None of the four tested 14B models are ranking-eligible in the current bundle, and Table~\ref{tab:highclass-failure} keeps all four rows visible with only identity and status text preserved. Leaving the other value fields empty makes the interpretation boundary explicit: these runs belong in a validity inventory, not in a comparative score table. Figure~\ref{fig:cross-tier-pareto} reflects the consequence directly: highclass contributes no valid points to the main frontier. This is not absent evidence. It is an empirical result about the scale boundary beyond which comparative claims about fine-tuning or model quality are no longer trustworthy under the current local runtime regime. That failure mode strengthens the paper's main argument by showing that runtime validity is part of what determines whether the benchmark is measuring policy quality at all.

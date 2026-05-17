@@ -1,0 +1,16 @@
+\section{Benchmark and Framework Setup}
+
+DiLu-Ollama extends the DiLu driving-agent loop into a local-first evaluation stack built on Ollama inference, \metric{highway-env}, and a benchmark-oriented reporting pipeline \cite{wen2023dilu,leurent2018highwayenv}. For this paper, we use only the highway benchmark path. Each run produces task metrics such as \metric{driving\_score\_v2}, task completion, and crash rate, together with latency and ranking-eligibility metadata. We treat that eligibility signal as part of the measurement outcome, because invalid runs in the current setup are often direct consequences of timeout escalation and latency collapse rather than random noise. Figure~\ref{fig:local-eval-validity-pipeline} summarizes this measurement path and makes the validity gate explicit: invalid runs are retained for screening and failure analysis rather than being silently removed before interpretation. Table~\ref{tab:validity-summary} therefore summarizes not only performance but also whether comparison remains methodologically sound across tiers.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{local_eval_validity_pipeline.png}
+\caption{Local evaluation and validity-handling pipeline. The figure shows the highway-only measurement path from Ollama-served local model families through the DiLu-style decision loop in \metric{highway-env} to benchmark-oriented reporting. Crucially, invalid runs are retained as outcomes and routed to screening or failure analysis rather than being silently filtered out.}
+\label{fig:local-eval-validity-pipeline}
+\end{figure}
+
+This distinction matters for intelligent-vehicle evaluation. A simulation benchmark is often expected to function as a comparative instrument for controller or policy selection. In the local LLM setting, however, the benchmark must also reveal when runtime behavior prevents that comparison from being fair or reproducible. DiLu-Ollama is designed to expose that failure boundary explicitly rather than hide it behind post-processing.
+
+The repository now also contains discrete cross-scenario support for merge and intersection environments, but those results are outside the evidential scope of this paper. All empirical claims below are tied to the current three-tier highway study bundle.
+
+With that benchmark boundary fixed, the next question is which fine-tuning comparisons remain valid enough to interpret.
